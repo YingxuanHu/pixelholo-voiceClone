@@ -22,11 +22,17 @@ pip install -r requirements.txt
 ## Usage
 ```bash
 # 1) Preprocess video into chunks + metadata.csv
-python src/preprocess.py --video /path/to/user.mp4 --name user_david
+python src/preprocess.py --video /path/to/user.mp4 --name name1
 
 # 2) Fine-tune StyleTTS2
 # Clone StyleTTS2 into ./lib/StyleTTS2 before training.
-python src/train.py --dataset_path ./data/user_david
+# Download the LibriTTS pretrained checkpoint + config into the repo:
+# mkdir -p lib/StyleTTS2/Models/LibriTTS
+# wget -O lib/StyleTTS2/Models/LibriTTS/epochs_2nd_00020.pth \
+#   https://huggingface.co/yl4579/StyleTTS2-LibriTTS/resolve/main/Models/LibriTTS/epochs_2nd_00020.pth
+# wget -O lib/StyleTTS2/Models/LibriTTS/config.yml \
+#   https://huggingface.co/yl4579/StyleTTS2-LibriTTS/resolve/main/Models/LibriTTS/config.yml
+python src/train.py --dataset_path ./data/name1
 
 # 3) Run the API (set default model path)
 export STYLE_TTS2_MODEL=/path/to/your/model.pth

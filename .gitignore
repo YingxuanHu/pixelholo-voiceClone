@@ -1,0 +1,15 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local datasets/models
+/data/
+/models/
+
+# OS files
+.DS_Store
