@@ -1,0 +1,10 @@
+torch
+torchaudio
+styletts2
+faster-whisper
+ffmpeg-python
+pydub
+fastapi
+uvicorn
+numpy
+pyyaml
