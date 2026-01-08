@@ -8,3 +8,8 @@ fastapi
 uvicorn
 numpy
 pyyaml
+librosa
+phonemizer
+nltk
+soundfile
+transformers

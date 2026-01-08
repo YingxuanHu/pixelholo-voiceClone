@@ -7,9 +7,9 @@ env/
 __pycache__/
 *.pyc
 
-# Local datasets/models
+# Local datasets/outputs
 /data/
-/models/
+/outputs/
 
 # OS files
 .DS_Store

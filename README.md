@@ -13,9 +13,17 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## CUDA libs for faster-whisper (if using pip cuDNN/cuBLAS)
+If `faster-whisper` fails to load cuDNN, point `LD_LIBRARY_PATH` at the pip-installed libs:
+```bash
+pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/nvidia/cudnn/lib:$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/nvidia/cublas/lib
+```
+
 ## Project layout
 - `data/` dataset outputs per speaker
-- `models/` checkpoints and logs
+- `outputs/training/` checkpoints and logs
+- `outputs/inference/` generated audio files
 - `src/` core scripts
 - `config.py` shared settings
 
@@ -33,15 +41,21 @@ python src/preprocess.py --video /path/to/user.mp4 --name name1
 # wget -O lib/StyleTTS2/Models/LibriTTS/config.yml \
 #   https://huggingface.co/yl4579/StyleTTS2-LibriTTS/resolve/main/Models/LibriTTS/config.yml
 python src/train.py --dataset_path ./data/name1
+# If you hit CUDA OOM, start with smaller settings:
+# python src/train.py --dataset_path ./data/name1 --batch_size 2 --max_len 200
+# Accent overfit run (new output dir, higher epochs, lower batch):
+# python src/train.py --dataset_path ./data/name1 --output_dir ./outputs/training/name1_accent --epochs 50 --batch_size 4 --max_len 500
 
 # 3) Run the API (set default model path)
 export STYLE_TTS2_MODEL=/path/to/your/model.pth
+export STYLE_TTS2_CONFIG=/path/to/config_ft.yml
+export STYLE_TTS2_REF_WAV=/path/to/reference.wav
 uvicorn src.inference:app --reload
 
 # 4) Request synthesis
 curl -X POST "http://localhost:8000/generate" \
   -H "Content-Type: application/json" \
-  -d '{"text":"Hello, I am now digital."}'
+  -d '{"text":"Hello, I am now digital.","ref_wav_path":"/path/to/reference.wav"}'
 ```
 
 ## Notes

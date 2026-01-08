@@ -62,7 +62,12 @@ def _write_train_val_lists(
 
     _write_list(train_list, train_rows)
     _write_list(val_list, val_rows if val_rows else train_rows[:1])
-    ood_list.write_text("\n")
+    ood_lines = [text for _fname, text, _speaker in (train_rows or val_rows)]
+    if not ood_lines:
+        ood_lines = ["hello world"]
+    with ood_list.open("w") as handle:
+        for line in ood_lines:
+            handle.write(f"{line}\n")
 
     return train_list, val_list, ood_list
 
@@ -79,18 +84,22 @@ def _patch_config(
     fp16_run: bool,
     epochs: int,
     pretrained_model: str | None,
+    max_steps: int | None,
+    grad_accum_steps: int | None,
 ) -> dict:
     config["log_dir"] = str(output_dir)
     config["batch_size"] = batch_size
     config["max_len"] = max_len
     config["fp16_run"] = fp16_run
     config["epochs"] = epochs
+    config["num_workers"] = config.get("num_workers", 0)
+    config["val_num_workers"] = config.get("val_num_workers", 0)
 
     data_params = config.get("data_params", {})
     data_params["train_data"] = str(train_list)
     data_params["val_data"] = str(val_list)
     data_params["OOD_data"] = str(ood_list)
-    data_params["root_path"] = str(dataset_root / PROCESSED_WAVS_DIRNAME)
+    data_params["root_path"] = str((dataset_root / PROCESSED_WAVS_DIRNAME).resolve())
     config["data_params"] = data_params
 
     preprocess_params = config.get("preprocess_params", {})
@@ -100,6 +109,10 @@ def _patch_config(
 
     if pretrained_model:
         config["pretrained_model"] = pretrained_model
+    if max_steps is not None:
+        config["max_steps"] = max_steps
+    if grad_accum_steps is not None:
+        config["grad_accum_steps"] = grad_accum_steps
 
     return config
 
@@ -121,6 +134,7 @@ def launch_training(
     use_accelerate: bool,
 ) -> None:
     entrypoint = _resolve_entrypoint(styletts2_dir, use_accelerate)
+    config_path = config_path.resolve()
 
     if use_accelerate and entrypoint.name == "train_finetune_accelerate.py":
         command = ["accelerate", "launch", str(entrypoint), "-p", str(config_path)]
@@ -144,6 +158,8 @@ def main() -> None:
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--use_accelerate", action="store_true")
+    parser.add_argument("--max_steps", type=int, help="Stop after this many training steps")
+    parser.add_argument("--grad_accum_steps", type=int, help="Gradient accumulation steps")
     parser.add_argument("--dry_run", action="store_true", help="Only write config, do not start training")
 
     args = parser.parse_args()
@@ -153,11 +169,13 @@ def main() -> None:
             f"StyleTTS2 repo not found at {args.styletts2_dir}. Clone it into lib/StyleTTS2."
         )
 
+    args.dataset_path = args.dataset_path.resolve()
     meta_path = args.dataset_path / METADATA_FILENAME
     if not meta_path.exists():
         raise FileNotFoundError(f"metadata.csv not found at {meta_path}")
 
-    output_dir = args.output_dir or (PROJECT_ROOT / "models" / "output_checkpoints" / args.dataset_path.name)
+    output_dir = args.output_dir or (PROJECT_ROOT / "outputs" / "training" / args.dataset_path.name)
+    output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     train_list, val_list, ood_list = _write_train_val_lists(
@@ -180,6 +198,8 @@ def main() -> None:
         fp16_run=args.fp16_run,
         epochs=args.epochs,
         pretrained_model=args.pretrained_checkpoint,
+        max_steps=args.max_steps,
+        grad_accum_steps=args.grad_accum_steps,
     )
 
     output_config_path = output_dir / "config_ft.yml"
