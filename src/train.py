@@ -2,12 +2,24 @@ import argparse
 import random
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
+
+warnings.filterwarnings(
+    "ignore",
+    message="`torch.nn.utils.weight_norm` is deprecated",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message="dropout option adds dropout after all but last recurrent layer",
+    category=UserWarning,
+)
 
 from config import (  # noqa: E402
     DEFAULT_BATCH_SIZE,
@@ -18,6 +30,49 @@ from config import (  # noqa: E402
     PROCESSED_WAVS_DIRNAME,
     STYLE_TTS2_DIR,
 )
+
+
+def _latest_checkpoint(output_dir: Path) -> Path | None:
+    checkpoints = sorted(output_dir.glob("epoch_2nd_*.pth"))
+    return checkpoints[-1] if checkpoints else None
+
+
+def _auto_pick_ref_wav(dataset_root: Path) -> Path | None:
+    wav_dir = dataset_root / PROCESSED_WAVS_DIRNAME
+    wavs = sorted(wav_dir.glob("*.wav"))
+    if not wavs:
+        return None
+
+    try:
+        import librosa
+        import numpy as np
+        import soundfile as sf
+    except Exception:
+        return wavs[0]
+
+    best: tuple[float, Path] | None = None
+    for path in wavs:
+        try:
+            audio, sr = sf.read(path)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            audio, _ = librosa.effects.trim(audio, top_db=35)
+            if len(audio) < sr:
+                continue
+            f0 = librosa.yin(audio, fmin=50, fmax=500, sr=sr)
+            f0 = f0[np.isfinite(f0)]
+            if f0.size == 0:
+                continue
+            flat = float(np.mean(librosa.feature.spectral_flatness(y=audio)))
+            f0_std = float(np.std(f0))
+            rms = float(np.sqrt(np.mean(np.square(audio))))
+            score = flat + (f0_std / 200.0) - (rms * 0.1)
+            if best is None or score < best[0]:
+                best = (score, path)
+        except Exception:
+            continue
+
+    return best[1] if best else wavs[0]
 
 
 def _load_base_config(styletts2_dir: Path, base_config: Path | None) -> tuple[dict, Path]:
@@ -161,6 +216,50 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, help="Stop after this many training steps")
     parser.add_argument("--grad_accum_steps", type=int, help="Gradient accumulation steps")
     parser.add_argument("--dry_run", action="store_true", help="Only write config, do not start training")
+    parser.add_argument(
+        "--auto_f0_scale",
+        action="store_true",
+        help="After training, generate a probe and write f0_scale.txt for this profile.",
+    )
+    parser.add_argument("--f0_ref_wav", type=Path, help="Reference wav for f0_scale probe")
+    parser.add_argument(
+        "--f0_text",
+        type=str,
+        default="Hello, this is a quick pitch calibration sample.",
+        help="Probe text for f0_scale estimation",
+    )
+    parser.add_argument(
+        "--auto_tune_profile",
+        action="store_true",
+        help="After training, auto-tune inference defaults and write profile.json.",
+    )
+    parser.add_argument("--tune_ref_wav", type=Path, help="Reference wav for profile tuning")
+    parser.add_argument(
+        "--tune_text",
+        type=str,
+        default="Hello, this is a quick pitch calibration sample.",
+        help="Probe text for profile tuning",
+    )
+    parser.add_argument(
+        "--auto_select_epoch",
+        action="store_true",
+        help="After training, score checkpoints and write best_epoch.txt.",
+    )
+    parser.add_argument("--select_ref_wav", type=Path, help="Reference wav for epoch selection")
+    parser.add_argument(
+        "--select_text",
+        type=str,
+        default="Hello, this is a quick pitch calibration sample.",
+        help="Probe text for epoch selection",
+    )
+    parser.add_argument("--select_limit", type=int, default=10, help="Check last N checkpoints")
+    parser.add_argument(
+        "--auto_build_lexicon",
+        action="store_true",
+        help="After training, generate data/<profile>/lexicon.json from metadata.csv.",
+    )
+    parser.add_argument("--lexicon_lang", type=str, default="en-us", help="Phonemizer language for lexicon")
+    parser.add_argument("--lexicon_min_count", type=int, default=1, help="Minimum word count for lexicon")
 
     args = parser.parse_args()
 
@@ -217,6 +316,85 @@ def main() -> None:
         config_path=output_config_path,
         use_accelerate=args.use_accelerate,
     )
+
+    latest_ckpt = _latest_checkpoint(output_dir)
+    if latest_ckpt is None:
+        return
+
+    auto_ref = None
+    if args.auto_f0_scale or args.auto_tune_profile or args.auto_select_epoch:
+        auto_ref = _auto_pick_ref_wav(args.dataset_path)
+        if auto_ref:
+            print(f"Auto-picked reference wav: {auto_ref}")
+
+    if args.auto_f0_scale:
+        auto_script = PROJECT_ROOT / "src" / "auto_f0_scale.py"
+        command = [
+            sys.executable,
+            str(auto_script),
+            "--model_path",
+            str(latest_ckpt),
+            "--config_path",
+            str(output_config_path),
+            "--text",
+            args.f0_text,
+        ]
+        ref = args.f0_ref_wav or auto_ref
+        if ref:
+            command += ["--ref_wav", str(ref)]
+        subprocess.run(command, check=True)
+
+    if args.auto_tune_profile:
+        tune_script = PROJECT_ROOT / "src" / "auto_tune_profile.py"
+        command = [
+            sys.executable,
+            str(tune_script),
+            "--model_path",
+            str(latest_ckpt),
+            "--config_path",
+            str(output_config_path),
+            "--text",
+            args.tune_text,
+            "--save_best",
+        ]
+        ref = args.tune_ref_wav or auto_ref
+        if ref:
+            command += ["--ref_wav", str(ref)]
+        subprocess.run(command, check=True)
+
+    if args.auto_select_epoch:
+        select_script = PROJECT_ROOT / "src" / "auto_select_epoch.py"
+        command = [
+            sys.executable,
+            str(select_script),
+            "--training_dir",
+            str(output_dir),
+            "--config_path",
+            str(output_config_path),
+            "--text",
+            args.select_text,
+            "--limit",
+            str(args.select_limit),
+            "--save_best",
+        ]
+        ref = args.select_ref_wav or args.tune_ref_wav or args.f0_ref_wav or auto_ref
+        if ref:
+            command += ["--ref_wav", str(ref)]
+        subprocess.run(command, check=True)
+
+    if args.auto_build_lexicon:
+        lex_script = PROJECT_ROOT / "src" / "build_lexicon.py"
+        command = [
+            sys.executable,
+            str(lex_script),
+            "--profile",
+            args.dataset_path.name,
+            "--lang",
+            args.lexicon_lang,
+            "--min_count",
+            str(args.lexicon_min_count),
+        ]
+        subprocess.run(command, check=True)
 
 
 if __name__ == "__main__":

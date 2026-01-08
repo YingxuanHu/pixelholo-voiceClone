@@ -19,6 +19,13 @@ If `faster-whisper` fails to load cuDNN, point `LD_LIBRARY_PATH` at the pip-inst
 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/nvidia/cudnn/lib:$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")/nvidia/cublas/lib
 ```
+To make it automatic per project, add it to the venv activation script:
+```bash
+cat >> .venv/bin/activate <<'EOF'
+VENV_SITE_PACKAGES=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$VENV_SITE_PACKAGES/nvidia/cudnn/lib:$VENV_SITE_PACKAGES/nvidia/cublas/lib"
+EOF
+```
 
 ## Project layout
 - `data/` dataset outputs per speaker
@@ -31,6 +38,10 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(python -c "import sysconfig; print(sys
 ```bash
 # 1) Preprocess video into chunks + metadata.csv
 python src/preprocess.py --video /path/to/user.mp4 --name name1
+# Defaults: denoise + VAD + stricter text filtering (language=en).
+# Optional preprocessing tweaks:
+# python src/preprocess.py --video /path/to/user.mp4 --name name1 --no-denoise
+# python src/preprocess.py --video /path/to/user.mp4 --name name1 --min_words 2 --min_avg_logprob -1.0
 
 # 2) Fine-tune StyleTTS2
 # Clone StyleTTS2 into ./lib/StyleTTS2 before training.
@@ -45,19 +56,76 @@ python src/train.py --dataset_path ./data/name1
 # python src/train.py --dataset_path ./data/name1 --batch_size 2 --max_len 200
 # Accent overfit run (new output dir, higher epochs, lower batch):
 # python src/train.py --dataset_path ./data/name1 --output_dir ./outputs/training/name1_accent --epochs 50 --batch_size 4 --max_len 500
+# Recommended: auto-tune inference + select best epoch + build lexicon
+# python src/train.py --dataset_path ./data/name1 \
+#   --auto_tune_profile --tune_ref_wav ./data/name1/processed_wavs/name1_0001.wav \
+#   --auto_select_epoch --select_ref_wav ./data/name1/processed_wavs/name1_0001.wav \
+#   --auto_build_lexicon --lexicon_lang en-us
+# If you omit the reference wav flags, train.py auto-picks a clean ref from processed_wavs.
 
-# 3) Run the API (set default model path)
-export STYLE_TTS2_MODEL=/path/to/your/model.pth
-export STYLE_TTS2_CONFIG=/path/to/config_ft.yml
-export STYLE_TTS2_REF_WAV=/path/to/reference.wav
-uvicorn src.inference:app --reload
+# 3) One-step inference (no server)
+python src/speak.py --profile name1 --text "Hello, this is a test."
 
-# 4) Request synthesis
-curl -X POST "http://localhost:8000/generate" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Hello, I am now digital.","ref_wav_path":"/path/to/reference.wav"}'
+# 4) Optional: run the API
+# export STYLE_TTS2_MODEL=/path/to/your/model.pth
+# export STYLE_TTS2_CONFIG=/path/to/config_ft.yml
+# export STYLE_TTS2_REF_WAV=/path/to/reference.wav
+# uvicorn src.inference:app --reload
+# curl -X POST "http://localhost:8000/generate" \
+#   -H "Content-Type: application/json" \
+#   -d '{"text":"Hello, I am now digital.","ref_wav_path":"/path/to/reference.wav"}'
 ```
+
+## Flag reference (common)
+### Preprocess (`src/preprocess.py`)
+- `--video`: input video path.
+- `--name`: profile name (writes into `data/<name>/`).
+- `--language`: Whisper language (default `en`).
+- `--denoise/--no-denoise`: enable/disable ffmpeg denoise pass.
+- `--min_words`: drop segments with fewer words (default 4).
+- `--min_avg_logprob`: drop low-confidence segments (default -0.5).
+- `--max_no_speech_prob`: drop likely non-speech segments (default 0.4).
+- `--merge_gap_sec`: merge adjacent segments within this gap.
+- `--legacy_split`: use silence splitting before transcription.
+- `--quiet`: reduce logs.
+
+### Train (`src/train.py`)
+- `--dataset_path`: profile dataset (e.g., `./data/name1`).
+- `--output_dir`: override checkpoint output folder.
+- `--epochs`, `--batch_size`, `--max_len`, `--grad_accum_steps`: training knobs.
+- `--auto_tune_profile`: writes `profile.json` (auto alpha/beta/steps/scale/f0).
+- `--auto_select_epoch`: writes `best_epoch.txt` + `epoch_scores.json`.
+- `--auto_build_lexicon`: writes `data/<name>/lexicon.json`.
+- `--tune_ref_wav` / `--select_ref_wav`: reference wav for tuning/selection.
+- If no reference wav is provided, the script auto-picks one from `processed_wavs`.
+
+### Inference (`src/speak.py`)
+- `--profile`: use `outputs/training/<profile>` + `data/<profile>`.
+- `--text`: text to synthesize.
+- `--ref_wav`: override reference wav.
+- `--phonemizer_lang`: accent locale (e.g., `en-us`, `en-gb`, `en-au`, `en-in`).
+- `--lexicon_path`: per-word pronunciation overrides.
 
 ## Notes
 - `src/train.py` patches a StyleTTS2 config and launches the finetune script.
 - `src/inference.py` caches the model in memory for low latency.
+- `src/auto_tune_profile.py` writes `profile.json` next to a checkpoint with tuned defaults.
+- If `profile.json` or `f0_scale.txt` exist next to a model, inference will use them automatically.
+- `src/auto_select_epoch.py` scores checkpoints and writes `best_epoch.txt`.
+- `src/auto_tune_profile.py` now also writes `f0_scale.txt` for downstream tools.
+- `src/build_lexicon.py` generates `lexicon.json` from metadata.
+
+## Accent overrides (optional)
+- Set `phonemizer_lang` per request or in `profile.json` (examples: `en-us`, `en-gb`, `en-au`, `en-in`).
+- Add a lexicon at `data/<profile>/lexicon.json` or pass `lexicon_path`:
+  ```json
+  {
+    "water": "w ɔː t əɹ",
+    "about": "əˈbæʊt"
+  }
+  ```
+  Values should be espeak-style phonemes (same format produced by the phonemizer).
+- Generate a default lexicon from your metadata:
+  ```bash
+  python src/build_lexicon.py --profile name1 --lang en-us
+  ```

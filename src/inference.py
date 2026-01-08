@@ -1,8 +1,13 @@
 import base64
+import contextlib
+import math
+import json
 import io
 import os
+import re
 import sys
 import threading
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +17,17 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+warnings.filterwarnings(
+    "ignore",
+    message="`torch.nn.utils.weight_norm` is deprecated",
+    category=FutureWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message="dropout option adds dropout after all but last recurrent layer",
+    category=UserWarning,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STYLE_TTS2_DIR = PROJECT_ROOT / "lib" / "StyleTTS2"
 
@@ -20,6 +36,15 @@ if STYLE_TTS2_DIR.exists():
 
 MEAN = -4
 STD = 4
+DEFAULT_ALPHA = 0.1
+DEFAULT_BETA = 0.1
+DEFAULT_DIFFUSION_STEPS = 10
+DEFAULT_EMBEDDING_SCALE = 1.5
+DEFAULT_F0_SCALE = 1.0
+DEFAULT_LANG = "en-us"
+
+_WORD_RE = re.compile(r"[A-Za-z']+|[^A-Za-z']+")
+_WORD_ONLY_RE = re.compile(r"[A-Za-z']+$")
 
 app = FastAPI()
 _engine_lock = threading.Lock()
@@ -129,16 +154,126 @@ def _resolve_config_path(model_path: Path, config_path: str | None) -> Path:
     )
 
 
+def _resolve_f0_scale(model_path: Path, f0_scale: float | None) -> float:
+    if f0_scale is not None:
+        return f0_scale
+
+    candidate = model_path.parent / "f0_scale.txt"
+    if candidate.exists():
+        try:
+            return float(candidate.read_text().strip())
+        except ValueError:
+            pass
+
+    return DEFAULT_F0_SCALE
+
+
+def _load_profile_defaults(model_path: Path) -> dict:
+    for filename in ("profile.json", "inference_defaults.json"):
+        candidate = model_path.parent / filename
+        if candidate.exists():
+            try:
+                data = json.loads(candidate.read_text())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                return data
+    return {}
+
+
+def _resolve_phonemizer_lang(model_path: Path, req: "GenerateRequest") -> str:
+    if req.phonemizer_lang:
+        return req.phonemizer_lang
+    profile = _load_profile_defaults(model_path)
+    if "phonemizer_lang" in profile:
+        return str(profile["phonemizer_lang"])
+    return os.getenv("STYLE_TTS2_LANG", DEFAULT_LANG)
+
+
+def _resolve_lexicon_path(model_path: Path, req: "GenerateRequest", speaker: str | None) -> Path | None:
+    if req.lexicon_path:
+        return Path(req.lexicon_path).expanduser()
+    profile = _load_profile_defaults(model_path)
+    if "lexicon_path" in profile:
+        return Path(str(profile["lexicon_path"])).expanduser()
+    env_path = os.getenv("STYLE_TTS2_LEXICON")
+    if env_path:
+        return Path(env_path).expanduser()
+    if speaker:
+        candidate = PROJECT_ROOT / "data" / speaker / "lexicon.json"
+        if candidate.exists():
+            return candidate
+    data_root = PROJECT_ROOT / "data"
+    processed_dirs = sorted(data_root.glob("*/processed_wavs"))
+    if len(processed_dirs) == 1:
+        candidate = processed_dirs[0].parent / "lexicon.json"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_lexicon(path: Path | None) -> dict[str, str] | None:
+    if path is None:
+        return None
+    if not path.exists():
+        raise HTTPException(status_code=400, detail=f"lexicon_path not found: {path}")
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid lexicon JSON: {path}") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Lexicon must be a JSON object.")
+    cleaned = {}
+    for key, value in data.items():
+        if isinstance(key, str) and isinstance(value, str):
+            cleaned[key.lower()] = value.strip()
+    return cleaned or None
+
+
+def _resolve_inference_params(model_path: Path, req: "GenerateRequest") -> dict[str, float]:
+    defaults = {
+        "alpha": DEFAULT_ALPHA,
+        "beta": DEFAULT_BETA,
+        "diffusion_steps": DEFAULT_DIFFUSION_STEPS,
+        "embedding_scale": DEFAULT_EMBEDDING_SCALE,
+        "f0_scale": DEFAULT_F0_SCALE,
+    }
+    profile = _load_profile_defaults(model_path)
+    for key in defaults:
+        if key in profile:
+            defaults[key] = profile[key]
+
+    params = {
+        "alpha": defaults["alpha"] if req.alpha is None else req.alpha,
+        "beta": defaults["beta"] if req.beta is None else req.beta,
+        "diffusion_steps": (
+            defaults["diffusion_steps"] if req.diffusion_steps is None else req.diffusion_steps
+        ),
+        "embedding_scale": (
+            defaults["embedding_scale"] if req.embedding_scale is None else req.embedding_scale
+        ),
+        "f0_scale": defaults["f0_scale"] if req.f0_scale is None else req.f0_scale,
+    }
+
+    if req.f0_scale is None and "f0_scale" not in profile:
+        params["f0_scale"] = _resolve_f0_scale(model_path, None)
+
+    return params
+
+
 class GenerateRequest(BaseModel):
     text: str
     model_path: str | None = None
     config_path: str | None = None
     ref_wav_path: str | None = None
     speaker: str | None = None
-    alpha: float = 0.1
-    beta: float = 0.1
-    diffusion_steps: int = 10
-    embedding_scale: float = 1.5
+    phonemizer_lang: str | None = None
+    lexicon_path: str | None = None
+    alpha: float | None = None
+    beta: float | None = None
+    diffusion_steps: int | None = None
+    embedding_scale: float | None = None
+    f0_scale: float | None = None
     return_base64: bool = False
 
 
@@ -175,17 +310,32 @@ class StyleTTS2RepoEngine:
         from Utils.PLBERT.util import load_plbert
 
         self._librosa = librosa
-        self._phonemizer = phonemizer.backend.EspeakBackend(
-            language="en-us",
-            preserve_punctuation=True,
-            with_stress=True,
-        )
+        self._phonemizer_backend = phonemizer.backend.EspeakBackend
+        self._phonemizers: dict[str, object] = {}
         self._word_tokenize = word_tokenize
         self._length_to_mask = length_to_mask
-        self._text_cleaner = TextCleaner()
 
         with self.config_path.open("r") as handle:
             self.config = yaml.safe_load(handle)
+
+        dist_cfg = (
+            self.config.get("model_params", {})
+            .get("diffusion", {})
+            .get("dist", {})
+        )
+        sigma_data = dist_cfg.get("sigma_data")
+        try:
+            sigma_value = float(sigma_data)
+            sigma_ok = math.isfinite(sigma_value)
+        except (TypeError, ValueError):
+            sigma_ok = False
+
+        if not sigma_ok:
+            dist_cfg["sigma_data"] = 0.2
+            dist_cfg["estimate_sigma_data"] = False
+            print(
+                f"Config sigma_data invalid ({sigma_data}); forcing to 0.2 for inference."
+            )
 
         preprocess_params = self.config.get("preprocess_params", {})
         self.sample_rate = int(preprocess_params.get("sr", 24000))
@@ -214,14 +364,18 @@ class StyleTTS2RepoEngine:
         if not (asr_config and asr_path and f0_path and plbert_dir):
             raise RuntimeError("Missing ASR/F0/PLBERT paths in config.")
 
-        text_aligner = load_ASR_models(str(asr_path), str(asr_config))
-        pitch_extractor = load_F0_models(str(f0_path))
-        plbert = load_plbert(str(plbert_dir))
+        quiet = os.getenv("STYLE_TTS2_QUIET", "1") == "1"
+        suppress = contextlib.redirect_stdout(io.StringIO()) if quiet else contextlib.nullcontext()
+        with suppress:
+            self._text_cleaner = TextCleaner()
+            text_aligner = load_ASR_models(str(asr_path), str(asr_config))
+            pitch_extractor = load_F0_models(str(f0_path))
+            plbert = load_plbert(str(plbert_dir))
 
-        model = build_model(model_params, text_aligner, pitch_extractor, plbert)
-        _ = [model[key].to(self.device) for key in model]
-        model, _, _, _ = load_checkpoint(model, None, str(self.model_path), load_only_params=True)
-        _ = [model[key].eval() for key in model]
+            model = build_model(model_params, text_aligner, pitch_extractor, plbert)
+            _ = [model[key].to(self.device) for key in model]
+            model, _, _, _ = load_checkpoint(model, None, str(self.model_path), load_only_params=True)
+            _ = [model[key].eval() for key in model]
 
         self.model = model
         self.sampler = DiffusionSampler(
@@ -238,6 +392,30 @@ class StyleTTS2RepoEngine:
             return self._word_tokenize(text)
         except LookupError:
             return text.split()
+
+    def _get_phonemizer(self, lang: str | None):
+        lang = lang or DEFAULT_LANG
+        if lang not in self._phonemizers:
+            self._phonemizers[lang] = self._phonemizer_backend(
+                language=lang,
+                preserve_punctuation=True,
+                with_stress=True,
+            )
+        return self._phonemizers[lang]
+
+    def _phonemize(self, text: str, lang: str | None, lexicon: dict[str, str] | None) -> str:
+        phonemizer = self._get_phonemizer(lang)
+        parts: list[str] = []
+        for token in _WORD_RE.findall(text):
+            if _WORD_ONLY_RE.match(token):
+                key = token.lower()
+                if lexicon and key in lexicon:
+                    parts.append(lexicon[key])
+                else:
+                    parts.append(phonemizer.phonemize([token])[0].strip())
+            else:
+                parts.append(token)
+        return "".join(parts)
 
     def _preprocess(self, wave: np.ndarray) -> torch.Tensor:
         wave_tensor = torch.from_numpy(wave).float()
@@ -272,12 +450,15 @@ class StyleTTS2RepoEngine:
         beta: float,
         diffusion_steps: int,
         embedding_scale: float,
+        f0_scale: float,
+        phonemizer_lang: str | None = None,
+        lexicon: dict[str, str] | None = None,
     ) -> np.ndarray:
         text = text.strip()
         if not text:
             raise ValueError("Text is empty.")
 
-        phonemes = self._phonemizer.phonemize([text])[0]
+        phonemes = self._phonemize(text, phonemizer_lang, lexicon)
         tokens = " ".join(self._tokenize(phonemes))
         token_ids = self._text_cleaner(tokens)
         token_ids.insert(0, 0)
@@ -339,6 +520,9 @@ class StyleTTS2RepoEngine:
                 en = asr_new
 
             f0_pred, n_pred = self.model.predictor.F0Ntrain(en, s)
+            if f0_scale != 1.0:
+                f0_pred = f0_pred * f0_scale
+            f0_pred = torch.nan_to_num(f0_pred, nan=0.0, posinf=0.0, neginf=0.0)
 
             asr = (t_en @ pred_aln_trg.unsqueeze(0))
             if self.model_params.decoder.type == "hifigan":
@@ -381,16 +565,23 @@ def generate(req: GenerateRequest):
 
     config_path = _resolve_config_path(model_path, req.config_path)
     ref_wav_path = _resolve_ref_wav(req.ref_wav_path, req.speaker)
+    params = _resolve_inference_params(model_path, req)
+    phonemizer_lang = _resolve_phonemizer_lang(model_path, req)
+    lexicon_path = _resolve_lexicon_path(model_path, req, req.speaker)
+    lexicon = _load_lexicon(lexicon_path)
 
     try:
         engine = _get_engine(model_path, config_path)
         audio = engine.generate(
             req.text,
             ref_wav_path=ref_wav_path,
-            alpha=req.alpha,
-            beta=req.beta,
-            diffusion_steps=req.diffusion_steps,
-            embedding_scale=req.embedding_scale,
+            alpha=params["alpha"],
+            beta=params["beta"],
+            diffusion_steps=params["diffusion_steps"],
+            embedding_scale=params["embedding_scale"],
+            f0_scale=params["f0_scale"],
+            phonemizer_lang=phonemizer_lang,
+            lexicon=lexicon,
         )
     except HTTPException:
         raise
