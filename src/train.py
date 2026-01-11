@@ -63,10 +63,7 @@ def _auto_pick_ref_wav(dataset_root: Path) -> Path | None:
             f0 = f0[np.isfinite(f0)]
             if f0.size == 0:
                 continue
-            flat = float(np.mean(librosa.feature.spectral_flatness(y=audio)))
-            f0_std = float(np.std(f0))
-            rms = float(np.sqrt(np.mean(np.square(audio))))
-            score = flat + (f0_std / 200.0) - (rms * 0.1)
+            score = float(np.median(f0))
             if best is None or score < best[0]:
                 best = (score, path)
         except Exception:
@@ -217,28 +214,25 @@ def main() -> None:
     parser.add_argument("--grad_accum_steps", type=int, help="Gradient accumulation steps")
     parser.add_argument("--dry_run", action="store_true", help="Only write config, do not start training")
     parser.add_argument(
-        "--auto_f0_scale",
-        action="store_true",
-        help="After training, generate a probe and write f0_scale.txt for this profile.",
-    )
-    parser.add_argument("--f0_ref_wav", type=Path, help="Reference wav for f0_scale probe")
-    parser.add_argument(
-        "--f0_text",
-        type=str,
-        default="Hello, this is a quick pitch calibration sample.",
-        help="Probe text for f0_scale estimation",
-    )
-    parser.add_argument(
         "--auto_tune_profile",
         action="store_true",
         help="After training, auto-tune inference defaults and write profile.json.",
     )
     parser.add_argument("--tune_ref_wav", type=Path, help="Reference wav for profile tuning")
+    parser.add_argument("--tune_ref_dir", type=Path, help="Directory of reference wavs for tuning")
+    parser.add_argument("--tune_ref_count", type=int, default=1, help="Number of references for tuning")
     parser.add_argument(
         "--tune_text",
         type=str,
         default="Hello, this is a quick pitch calibration sample.",
         help="Probe text for profile tuning",
+    )
+    parser.add_argument("--tune_probe_texts", type=Path, help="Text file with prompts for tuning")
+    parser.add_argument("--tune_thorough", action="store_true", help="Use multiple refs/texts for tuning")
+    parser.add_argument(
+        "--tune_quick",
+        action="store_true",
+        help="Disable thorough tuning even when auto-tuning is enabled.",
     )
     parser.add_argument(
         "--auto_select_epoch",
@@ -246,13 +240,22 @@ def main() -> None:
         help="After training, score checkpoints and write best_epoch.txt.",
     )
     parser.add_argument("--select_ref_wav", type=Path, help="Reference wav for epoch selection")
+    parser.add_argument("--select_ref_dir", type=Path, help="Directory of reference wavs for selection")
+    parser.add_argument("--select_ref_count", type=int, default=1, help="Number of references for selection")
     parser.add_argument(
         "--select_text",
         type=str,
         default="Hello, this is a quick pitch calibration sample.",
         help="Probe text for epoch selection",
     )
-    parser.add_argument("--select_limit", type=int, default=10, help="Check last N checkpoints")
+    parser.add_argument("--select_probe_texts", type=Path, help="Text file with prompts for selection")
+    parser.add_argument("--select_thorough", action="store_true", help="Use multiple refs/texts for selection")
+    parser.add_argument(
+        "--select_quick",
+        action="store_true",
+        help="Disable thorough selection even when auto-select is enabled.",
+    )
+    parser.add_argument("--select_limit", type=int, help="Check last N checkpoints")
     parser.add_argument(
         "--auto_build_lexicon",
         action="store_true",
@@ -262,6 +265,16 @@ def main() -> None:
     parser.add_argument("--lexicon_min_count", type=int, default=1, help="Minimum word count for lexicon")
 
     args = parser.parse_args()
+
+    if args.tune_quick:
+        args.tune_thorough = False
+    elif args.auto_tune_profile:
+        args.tune_thorough = True
+
+    if args.select_quick:
+        args.select_thorough = False
+    elif args.auto_select_epoch:
+        args.select_thorough = True
 
     if not args.styletts2_dir.exists():
         raise FileNotFoundError(
@@ -322,27 +335,10 @@ def main() -> None:
         return
 
     auto_ref = None
-    if args.auto_f0_scale or args.auto_tune_profile or args.auto_select_epoch:
+    if args.auto_tune_profile or args.auto_select_epoch:
         auto_ref = _auto_pick_ref_wav(args.dataset_path)
         if auto_ref:
             print(f"Auto-picked reference wav: {auto_ref}")
-
-    if args.auto_f0_scale:
-        auto_script = PROJECT_ROOT / "src" / "auto_f0_scale.py"
-        command = [
-            sys.executable,
-            str(auto_script),
-            "--model_path",
-            str(latest_ckpt),
-            "--config_path",
-            str(output_config_path),
-            "--text",
-            args.f0_text,
-        ]
-        ref = args.f0_ref_wav or auto_ref
-        if ref:
-            command += ["--ref_wav", str(ref)]
-        subprocess.run(command, check=True)
 
     if args.auto_tune_profile:
         tune_script = PROJECT_ROOT / "src" / "auto_tune_profile.py"
@@ -357,6 +353,14 @@ def main() -> None:
             args.tune_text,
             "--save_best",
         ]
+        if args.tune_probe_texts:
+            command += ["--probe_texts", str(args.tune_probe_texts)]
+        if args.tune_ref_dir:
+            command += ["--ref_dir", str(args.tune_ref_dir)]
+        if args.tune_ref_count:
+            command += ["--ref_count", str(args.tune_ref_count)]
+        if args.tune_thorough:
+            command.append("--thorough")
         ref = args.tune_ref_wav or auto_ref
         if ref:
             command += ["--ref_wav", str(ref)]
@@ -373,11 +377,19 @@ def main() -> None:
             str(output_config_path),
             "--text",
             args.select_text,
-            "--limit",
-            str(args.select_limit),
             "--save_best",
         ]
-        ref = args.select_ref_wav or args.tune_ref_wav or args.f0_ref_wav or auto_ref
+        if args.select_probe_texts:
+            command += ["--probe_texts", str(args.select_probe_texts)]
+        if args.select_ref_dir:
+            command += ["--ref_dir", str(args.select_ref_dir)]
+        if args.select_ref_count:
+            command += ["--ref_count", str(args.select_ref_count)]
+        if args.select_thorough:
+            command.append("--thorough")
+        if args.select_limit is not None:
+            command += ["--limit", str(args.select_limit)]
+        ref = args.select_ref_wav or args.tune_ref_wav or auto_ref
         if ref:
             command += ["--ref_wav", str(ref)]
         subprocess.run(command, check=True)

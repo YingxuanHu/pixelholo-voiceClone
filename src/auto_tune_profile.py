@@ -8,6 +8,14 @@ import soundfile as sf
 
 from inference import StyleTTS2RepoEngine
 
+DEFAULT_PROBE_TEXTS = [
+    "Hello, this is a quick pitch calibration sample.",
+    "The quick brown fox jumps over the lazy dog.",
+    "We repaired the loose screw and the wobbly leg.",
+    "Please call me tomorrow morning at nine.",
+    "I can't make the meeting today, sorry about that.",
+]
+
 
 def _find_latest_checkpoint(training_dir: Path) -> Path | None:
     checkpoints = sorted(training_dir.glob("epoch_2nd_*.pth"))
@@ -56,6 +64,23 @@ def _median_f0(audio: np.ndarray, sr: int) -> float:
     return float(np.median(f0))
 
 
+def _f0_contour(audio: np.ndarray, sr: int) -> np.ndarray:
+    f0 = librosa.yin(audio, fmin=50, fmax=500, sr=sr)
+    f0 = f0[np.isfinite(f0)]
+    return f0
+
+
+def _f0_correlation(ref_f0: np.ndarray, out_f0: np.ndarray) -> float:
+    if ref_f0.size < 5 or out_f0.size < 5:
+        return 0.0
+    size = min(ref_f0.size, out_f0.size)
+    ref = np.log(ref_f0[:size] + 1e-6)
+    out = np.log(out_f0[:size] + 1e-6)
+    ref = (ref - ref.mean()) / (ref.std() + 1e-6)
+    out = (out - out.mean()) / (out.std() + 1e-6)
+    return float(np.mean(ref * out))
+
+
 def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str, float]:
     ref_trim = _trim(ref_audio)
     out_trim = _trim(out_audio)
@@ -74,7 +99,8 @@ def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str,
     mfcc_out = librosa.feature.mfcc(y=out_trim, sr=sr, n_mfcc=13)
     v_ref = np.mean(mfcc_ref, axis=1)
     v_out = np.mean(mfcc_out, axis=1)
-    mfcc_cos = float(np.dot(v_ref, v_out) / (np.linalg.norm(v_ref) * np.linalg.norm(v_out)))
+    denom = (np.linalg.norm(v_ref) * np.linalg.norm(v_out)) or 1.0
+    mfcc_cos = float(np.dot(v_ref, v_out) / denom)
 
     flat_ref = float(np.mean(librosa.feature.spectral_flatness(y=ref_trim)))
     flat_out = float(np.mean(librosa.feature.spectral_flatness(y=out_trim)))
@@ -84,20 +110,33 @@ def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str,
     rms_out = float(np.sqrt(np.mean(np.square(out_trim))))
     rms_ratio = rms_out / rms_ref if rms_ref > 0 else 1.0
 
+    centroid_ref = float(np.mean(librosa.feature.spectral_centroid(y=ref_trim, sr=sr)))
+    centroid_out = float(np.mean(librosa.feature.spectral_centroid(y=out_trim, sr=sr)))
+    centroid_ratio = centroid_out / centroid_ref if centroid_ref > 0 else 1.0
+
+    f0_corr = _f0_correlation(_f0_contour(ref_trim, sr), _f0_contour(out_trim, sr))
+
     return {
         "pitch_ratio": pitch_ratio,
         "mfcc_cos": mfcc_cos,
         "flat_diff": flat_diff,
         "rms_ratio": rms_ratio,
+        "centroid_ratio": centroid_ratio,
+        "f0_corr": f0_corr,
     }
 
 
 def _score(metrics: dict[str, float]) -> float:
+    pitch_err = abs(np.log(metrics["pitch_ratio"])) if metrics["pitch_ratio"] > 0 else 1.0
+    rms_err = abs(np.log(metrics["rms_ratio"])) if metrics["rms_ratio"] > 0 else 1.0
+    centroid_err = abs(np.log(metrics["centroid_ratio"])) if metrics["centroid_ratio"] > 0 else 1.0
     return (
-        abs(metrics["pitch_ratio"] - 1.0)
+        pitch_err
         + metrics["flat_diff"] * 2.0
-        + abs(metrics["rms_ratio"] - 1.0) * 0.2
+        + rms_err * 0.2
+        + centroid_err * 0.3
         - metrics["mfcc_cos"] * 0.1
+        - metrics["f0_corr"] * 0.1
     )
 
 
@@ -113,17 +152,55 @@ def _parse_int_list(value: str | None, default: list[int]) -> list[int]:
     return [int(x.strip()) for x in value.split(",") if x.strip()]
 
 
+def _load_texts(path: Path | None) -> list[str]:
+    if path is None:
+        return []
+    if not path.exists():
+        raise FileNotFoundError(f"probe_texts not found: {path}")
+    lines = [line.strip() for line in path.read_text().splitlines()]
+    return [line for line in lines if line]
+
+
+def _rank_reference_wavs(ref_dir: Path) -> list[Path]:
+    wavs = sorted(ref_dir.glob("*.wav"))
+    if not wavs:
+        return []
+    scored: list[tuple[float, Path]] = []
+    for path in wavs:
+        try:
+            audio, sr = sf.read(path)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            audio, _ = librosa.effects.trim(audio, top_db=35)
+            if len(audio) < sr:
+                continue
+            f0 = librosa.yin(audio, fmin=50, fmax=500, sr=sr)
+            f0 = f0[np.isfinite(f0)]
+            if f0.size == 0:
+                continue
+            score = float(np.median(f0))
+            scored.append((score, path))
+        except Exception:
+            continue
+    scored.sort(key=lambda item: item[0])
+    return [path for _score, path in scored] or wavs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Auto-tune inference params for a profile.")
     parser.add_argument("--profile", help="Profile name (uses outputs/training/<profile>).")
     parser.add_argument("--model_path", type=Path, help="Override model checkpoint path.")
     parser.add_argument("--config_path", type=Path, help="Override config path.")
     parser.add_argument("--ref_wav", type=Path, help="Reference wav for tuning.")
+    parser.add_argument("--ref_dir", type=Path, help="Directory of reference wavs.")
+    parser.add_argument("--ref_count", type=int, default=1, help="Number of references to use.")
     parser.add_argument(
         "--text",
         default="Hello, this is a quick pitch calibration sample.",
         help="Text prompt for the probe generation.",
     )
+    parser.add_argument("--probe_texts", type=Path, help="Text file with one prompt per line.")
+    parser.add_argument("--thorough", action="store_true", help="Use multiple refs + probe texts.")
     parser.add_argument("--alphas", help="Comma-separated alpha values.")
     parser.add_argument("--betas", help="Comma-separated beta values.")
     parser.add_argument("--diffusions", help="Comma-separated diffusion steps.")
@@ -164,8 +241,33 @@ def main() -> None:
     if ref_wav is None and profile_dir is not None:
         ref_wav = _pick_reference_wav(profile_dir)
 
-    if ref_wav is None or not ref_wav.exists():
-        raise FileNotFoundError("Reference wav not found. Provide --ref_wav.")
+    texts = _load_texts(args.probe_texts)
+    if not texts:
+        texts = DEFAULT_PROBE_TEXTS if args.thorough else [args.text]
+    if args.text and args.text not in texts:
+        texts.append(args.text)
+
+    ref_wavs: list[Path] = []
+    if ref_wav is not None:
+        ref_wavs.append(ref_wav)
+    target_refs = max(args.ref_count, 3) if args.thorough else args.ref_count
+
+    ref_dir = args.ref_dir
+    if ref_dir is None and profile_dir is not None:
+        candidate = profile_dir / "processed_wavs"
+        if candidate.exists():
+            ref_dir = candidate
+
+    if ref_dir:
+        ranked = _rank_reference_wavs(ref_dir.resolve())
+        for path in ranked:
+            if path not in ref_wavs:
+                ref_wavs.append(path)
+            if len(ref_wavs) >= target_refs:
+                break
+
+    if not ref_wavs:
+        raise FileNotFoundError("Reference wav not found. Provide --ref_wav or --ref_dir.")
 
     alphas = _parse_list(args.alphas, [0.1, 0.3])
     betas = _parse_list(args.betas, [0.1, 0.3])
@@ -174,29 +276,34 @@ def main() -> None:
 
     print(f"Using model: {model_path}")
     print(f"Using config: {config_path}")
-    print(f"Using ref wav: {ref_wav}")
+    print(f"Using {len(ref_wavs)} reference wav(s) and {len(texts)} prompt(s).")
 
     engine = StyleTTS2RepoEngine(model_path=model_path, config_path=config_path)
     sr = engine.sample_rate
 
-    ref_audio = _load_mono(ref_wav, sr)
     lexicon = _load_lexicon(args.lexicon_path)
 
     # First pass to estimate f0_scale.
-    probe_audio = engine.generate(
-        args.text,
-        ref_wav_path=ref_wav,
-        alpha=0.1,
-        beta=0.1,
-        diffusion_steps=10,
-        embedding_scale=1.5,
-        f0_scale=1.0,
-        phonemizer_lang=args.phonemizer_lang,
-        lexicon=lexicon,
-    )
-    f0_ref = _median_f0(_trim(ref_audio), sr)
-    f0_out = _median_f0(_trim(probe_audio), sr)
-    f0_scale = 1.0 / (f0_out / f0_ref)
+    probe_text = texts[0]
+    f0_scales = []
+    for ref_path in ref_wavs:
+        ref_audio = _load_mono(ref_path, sr)
+        probe_audio = engine.generate(
+            probe_text,
+            ref_wav_path=ref_path,
+            alpha=0.1,
+            beta=0.1,
+            diffusion_steps=10,
+            embedding_scale=1.5,
+            f0_scale=1.0,
+            phonemizer_lang=args.phonemizer_lang,
+            lexicon=lexicon,
+        )
+        f0_ref = _median_f0(_trim(ref_audio), sr)
+        f0_out = _median_f0(_trim(probe_audio), sr)
+        f0_scales.append(1.0 / (f0_out / f0_ref))
+
+    f0_scale = float(np.median(f0_scales)) if f0_scales else 1.0
 
     print(f"Estimated f0_scale: {f0_scale:.4f}")
 
@@ -206,31 +313,61 @@ def main() -> None:
         for beta in betas:
             for diffusion_steps in diffusions:
                 for embedding_scale in embeddings:
-                    audio = engine.generate(
-                        args.text,
-                        ref_wav_path=ref_wav,
-                        alpha=alpha,
-                        beta=beta,
-                        diffusion_steps=diffusion_steps,
-                        embedding_scale=embedding_scale,
-                        f0_scale=f0_scale,
-                        phonemizer_lang=args.phonemizer_lang,
-                        lexicon=lexicon,
-                    )
-                    metrics = _metrics(ref_audio, audio, sr)
-                    score = _score(metrics)
+                    all_metrics: dict[str, list[float]] = {
+                        "pitch_ratio": [],
+                        "mfcc_cos": [],
+                        "flat_diff": [],
+                        "rms_ratio": [],
+                        "centroid_ratio": [],
+                        "f0_corr": [],
+                    }
+                    failures = 0
+                    best_sample = None
+                    best_sample_score = None
+                    for ref_path in ref_wavs:
+                        ref_audio = _load_mono(ref_path, sr)
+                        for text in texts:
+                            try:
+                                audio = engine.generate(
+                                    text,
+                                    ref_wav_path=ref_path,
+                                    alpha=alpha,
+                                    beta=beta,
+                                    diffusion_steps=diffusion_steps,
+                                    embedding_scale=embedding_scale,
+                                    f0_scale=f0_scale,
+                                    phonemizer_lang=args.phonemizer_lang,
+                                    lexicon=lexicon,
+                                )
+                                metrics = _metrics(ref_audio, audio, sr)
+                                score = _score(metrics)
+                                for key, value in metrics.items():
+                                    if np.isfinite(value):
+                                        all_metrics[key].append(float(value))
+                                if best_sample_score is None or score < best_sample_score:
+                                    best_sample_score = score
+                                    best_sample = audio
+                            except Exception:
+                                failures += 1
+                                continue
+
+                    summary = {}
+                    for key, values in all_metrics.items():
+                        summary[key] = float(np.mean(values)) if values else 0.0
+                    score = _score(summary) + (failures * 0.5)
                     record = {
                         "alpha": alpha,
                         "beta": beta,
                         "diffusion_steps": diffusion_steps,
                         "embedding_scale": embedding_scale,
                         "f0_scale": f0_scale,
-                        "metrics": metrics,
+                        "metrics": summary,
                         "score": score,
+                        "failures": failures,
                     }
                     if best is None or score < best["score"]:
                         best = record
-                        best_audio = audio
+                        best_audio = best_sample
 
     if best is None:
         raise RuntimeError("No candidates evaluated.")
@@ -238,7 +375,7 @@ def main() -> None:
     profile = {
         "model_path": str(model_path),
         "config_path": str(config_path),
-        "ref_wav_path": str(ref_wav),
+        "ref_wav_path": str(ref_wavs[0]),
         "alpha": best["alpha"],
         "beta": best["beta"],
         "diffusion_steps": best["diffusion_steps"],
@@ -261,7 +398,7 @@ def main() -> None:
     print(f"Saved f0_scale: {f0_path}")
 
     if args.save_best and best_audio is not None:
-        out_dir = project_root / "outputs" / "inference"
+        out_dir = project_root / "outputs" / "inference" / model_path.parent.name
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{model_path.stem}_best.wav"
         sf.write(out_path, best_audio, sr)

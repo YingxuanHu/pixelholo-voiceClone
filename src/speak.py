@@ -1,7 +1,9 @@
 import argparse
 import json
+import re
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
 
 from inference import StyleTTS2RepoEngine
@@ -25,7 +27,34 @@ def _find_best_checkpoint(training_dir: Path) -> Path | None:
 
 def _pick_reference_wav(profile_dir: Path) -> Path | None:
     wavs = sorted((profile_dir / "processed_wavs").glob("*.wav"))
-    return wavs[0] if wavs else None
+    if not wavs:
+        return None
+    try:
+        import librosa
+        import numpy as np
+    except Exception:
+        return wavs[0]
+
+    best: tuple[float, Path] | None = None
+    for path in wavs:
+        try:
+            audio, sr = sf.read(path)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            audio, _ = librosa.effects.trim(audio, top_db=35)
+            if len(audio) < sr:
+                continue
+            f0 = librosa.yin(audio, fmin=50, fmax=500, sr=sr)
+            f0 = f0[np.isfinite(f0)]
+            if f0.size == 0:
+                continue
+            score = float(np.median(f0))
+            if best is None or score < best[0]:
+                best = (score, path)
+        except Exception:
+            continue
+
+    return best[1] if best else wavs[0]
 
 
 def _load_profile_defaults(model_path: Path) -> dict:
@@ -66,6 +95,27 @@ def _load_f0_scale(model_path: Path) -> float | None:
     return None
 
 
+def _split_text(text: str, max_chars: int, max_words: int) -> list[str]:
+    if not text:
+        return []
+    sentences = [s.strip() for s in re.findall(r"[^.!?]+[.!?]?", text) if s.strip()]
+    chunks: list[str] = []
+    for sentence in sentences:
+        if len(sentence) <= max_chars and len(sentence.split()) <= max_words:
+            chunks.append(sentence)
+            continue
+        words = sentence.split()
+        current: list[str] = []
+        for word in words:
+            current.append(word)
+            if len(" ".join(current)) >= max_chars or len(current) >= max_words:
+                chunks.append(" ".join(current))
+                current = []
+        if current:
+            chunks.append(" ".join(current))
+    return chunks
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="One-step local inference (no server).")
     parser.add_argument("--profile", help="Profile name (uses outputs/training/<profile>).")
@@ -81,6 +131,24 @@ def main() -> None:
     parser.add_argument("--f0_scale", type=float)
     parser.add_argument("--phonemizer_lang", type=str)
     parser.add_argument("--lexicon_path", type=Path)
+    parser.add_argument(
+        "--max_chunk_chars",
+        type=int,
+        default=220,
+        help="Split long text into chunks of this many characters.",
+    )
+    parser.add_argument(
+        "--max_chunk_words",
+        type=int,
+        default=60,
+        help="Split long text into chunks of this many words.",
+    )
+    parser.add_argument(
+        "--pause_ms",
+        type=int,
+        default=180,
+        help="Silence between chunks (ms).",
+    )
 
     args = parser.parse_args()
 
@@ -110,14 +178,17 @@ def main() -> None:
     if config_path is None or not config_path.exists():
         raise FileNotFoundError("Config not found. Provide --config_path or ensure config_ft.yml exists.")
 
+    defaults = _load_profile_defaults(model_path)
     ref_wav = args.ref_wav
+    if ref_wav is None:
+        candidate = defaults.get("ref_wav_path")
+        if candidate:
+            ref_wav = Path(candidate)
     if ref_wav is None and profile_dir is not None:
         ref_wav = _pick_reference_wav(profile_dir)
 
     if ref_wav is None or not ref_wav.exists():
         raise FileNotFoundError("Reference wav not found. Provide --ref_wav.")
-
-    defaults = _load_profile_defaults(model_path)
     f0_scale = args.f0_scale
     if f0_scale is None:
         f0_scale = defaults.get("f0_scale")
@@ -146,6 +217,10 @@ def main() -> None:
         if args.lexicon_path is not None
         else defaults.get("lexicon_path")
     )
+    if lexicon_path is None and profile_dir is not None:
+        candidate = profile_dir / "lexicon.json"
+        if candidate.exists():
+            lexicon_path = candidate
     lexicon = _load_lexicon(Path(lexicon_path)) if lexicon_path else None
 
     out_path = args.out
@@ -155,17 +230,29 @@ def main() -> None:
         out_path = out_dir / f"{model_path.stem}_speak.wav"
 
     engine = StyleTTS2RepoEngine(model_path=model_path, config_path=config_path)
-    audio = engine.generate(
-        args.text,
-        ref_wav_path=ref_wav,
-        alpha=alpha,
-        beta=beta,
-        diffusion_steps=diffusion_steps,
-        embedding_scale=embedding_scale,
-        f0_scale=f0_scale,
-        phonemizer_lang=phonemizer_lang,
-        lexicon=lexicon,
-    )
+    chunks = _split_text(args.text, args.max_chunk_chars, args.max_chunk_words)
+    if not chunks:
+        raise ValueError("No text to synthesize.")
+
+    audio_parts: list[np.ndarray] = []
+    pause = np.zeros(int(engine.sample_rate * (args.pause_ms / 1000.0)), dtype=np.float32)
+    for idx, chunk in enumerate(chunks):
+        audio = engine.generate(
+            chunk,
+            ref_wav_path=ref_wav,
+            alpha=alpha,
+            beta=beta,
+            diffusion_steps=diffusion_steps,
+            embedding_scale=embedding_scale,
+            f0_scale=f0_scale,
+            phonemizer_lang=phonemizer_lang,
+            lexicon=lexicon,
+        )
+        audio_parts.append(audio.astype(np.float32, copy=False))
+        if idx < len(chunks) - 1:
+            audio_parts.append(pause)
+
+    audio = np.concatenate(audio_parts)
 
     sf.write(out_path, audio, engine.sample_rate)
     print(f"Saved: {out_path}")

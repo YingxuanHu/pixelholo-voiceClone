@@ -396,11 +396,22 @@ class StyleTTS2RepoEngine:
     def _get_phonemizer(self, lang: str | None):
         lang = lang or DEFAULT_LANG
         if lang not in self._phonemizers:
-            self._phonemizers[lang] = self._phonemizer_backend(
-                language=lang,
-                preserve_punctuation=True,
-                with_stress=True,
-            )
+            try:
+                self._phonemizers[lang] = self._phonemizer_backend(
+                    language=lang,
+                    preserve_punctuation=True,
+                    with_stress=True,
+                )
+            except RuntimeError:
+                fallback = "en-us" if lang != "en-us" else None
+                if fallback:
+                    self._phonemizers[lang] = self._phonemizer_backend(
+                        language=fallback,
+                        preserve_punctuation=True,
+                        with_stress=True,
+                    )
+                else:
+                    raise
         return self._phonemizers[lang]
 
     def _phonemize(self, text: str, lang: str | None, lexicon: dict[str, str] | None) -> str:

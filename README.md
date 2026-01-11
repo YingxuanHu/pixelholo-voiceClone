@@ -56,12 +56,18 @@ python src/train.py --dataset_path ./data/name1
 # python src/train.py --dataset_path ./data/name1 --batch_size 2 --max_len 200
 # Accent overfit run (new output dir, higher epochs, lower batch):
 # python src/train.py --dataset_path ./data/name1 --output_dir ./outputs/training/name1_accent --epochs 50 --batch_size 4 --max_len 500
-# Recommended: auto-tune inference + select best epoch + build lexicon
+# Recommended: auto-tune inference + select best epoch (all checkpoints) + build lexicon
 # python src/train.py --dataset_path ./data/name1 \
 #   --auto_tune_profile --tune_ref_wav ./data/name1/processed_wavs/name1_0001.wav \
 #   --auto_select_epoch --select_ref_wav ./data/name1/processed_wavs/name1_0001.wav \
 #   --auto_build_lexicon --lexicon_lang en-us
-# If you omit the reference wav flags, train.py auto-picks a clean ref from processed_wavs.
+# If you omit the reference wav flags, train.py auto-picks the lowest-pitch clip from processed_wavs.
+# Thorough selection/tuning is now the default when auto-tuning/selecting.
+# To force a faster (single-ref/single-text) pass:
+# python src/train.py --dataset_path ./data/name1 \
+#   --auto_tune_profile --tune_quick \
+#   --auto_select_epoch --select_quick \
+#   --auto_build_lexicon --lexicon_lang en-us
 
 # 3) One-step inference (no server)
 python src/speak.py --profile name1 --text "Hello, this is a test."
@@ -94,9 +100,15 @@ python src/speak.py --profile name1 --text "Hello, this is a test."
 - `--output_dir`: override checkpoint output folder.
 - `--epochs`, `--batch_size`, `--max_len`, `--grad_accum_steps`: training knobs.
 - `--auto_tune_profile`: writes `profile.json` (auto alpha/beta/steps/scale/f0).
-- `--auto_select_epoch`: writes `best_epoch.txt` + `epoch_scores.json`.
+- `--auto_select_epoch`: writes `best_epoch.txt` + `epoch_scores.json` (evaluates all epochs unless `--select_limit` is set).
 - `--auto_build_lexicon`: writes `data/<name>/lexicon.json`.
+- `--lexicon_lang`: language code for lexicon generation (defaults to `en-us`).
 - `--tune_ref_wav` / `--select_ref_wav`: reference wav for tuning/selection.
+- `--tune_ref_dir` / `--select_ref_dir`: directory of reference wavs (prefers lowest-pitch clips).
+- `--tune_ref_count` / `--select_ref_count`: how many refs to evaluate (default 1).
+- `--tune_probe_texts` / `--select_probe_texts`: text file with one prompt per line.
+- `--tune_thorough` / `--select_thorough`: use multiple refs + multiple prompts (slower, more stable).
+- `--tune_quick` / `--select_quick`: force single-ref/single-text quick pass.
 - If no reference wav is provided, the script auto-picks one from `processed_wavs`.
 
 ### Inference (`src/speak.py`)
@@ -104,7 +116,9 @@ python src/speak.py --profile name1 --text "Hello, this is a test."
 - `--text`: text to synthesize.
 - `--ref_wav`: override reference wav.
 - `--phonemizer_lang`: accent locale (e.g., `en-us`, `en-gb`, `en-au`, `en-in`).
-- `--lexicon_path`: per-word pronunciation overrides.
+- `--lexicon_path`: per-word pronunciation overrides (defaults to `data/<profile>/lexicon.json` if present).
+- `--max_chunk_chars` / `--max_chunk_words`: auto-split long text to avoid BERT token limits.
+- `--pause_ms`: silence inserted between chunks.
 
 ## Notes
 - `src/train.py` patches a StyleTTS2 config and launches the finetune script.
@@ -116,7 +130,7 @@ python src/speak.py --profile name1 --text "Hello, this is a test."
 - `src/build_lexicon.py` generates `lexicon.json` from metadata.
 
 ## Accent overrides (optional)
-- Set `phonemizer_lang` per request or in `profile.json` (examples: `en-us`, `en-gb`, `en-au`, `en-in`).
+- Set `phonemizer_lang` per request or in `profile.json` (examples: `en`, `en-gb`, `en-au`, `en-in`).
 - Add a lexicon at `data/<profile>/lexicon.json` or pass `lexicon_path`:
   ```json
   {

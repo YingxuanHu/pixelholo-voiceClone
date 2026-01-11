@@ -60,11 +60,18 @@ def main() -> None:
     words = [word for word, count in counts.items() if count >= args.min_count]
     words.sort()
 
-    backend = phonemizer.backend.EspeakBackend(
-        language=args.lang,
-        preserve_punctuation=False,
-        with_stress=True,
-    )
+    try:
+        backend = phonemizer.backend.EspeakBackend(
+            language=args.lang,
+            preserve_punctuation=False,
+            with_stress=True,
+        )
+    except RuntimeError:
+        backend = phonemizer.backend.EspeakBackend(
+            language="en-us",
+            preserve_punctuation=False,
+            with_stress=True,
+        )
 
     lexicon = {}
     for word in words:
