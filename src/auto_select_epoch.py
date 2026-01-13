@@ -1,13 +1,18 @@
 import argparse
 import json
+import re
 from pathlib import Path
 
 import librosa
 import numpy as np
 import soundfile as sf
 import torch
+import yaml
+import yaml
 
 from inference import StyleTTS2RepoEngine
+
+_EPOCH_RE = re.compile(r"epoch_2nd_(\d+)", re.IGNORECASE)
 
 DEFAULT_PROBE_TEXTS = [
     "Hello, this is a quick pitch calibration sample.",
@@ -53,6 +58,31 @@ def _median_f0(audio: np.ndarray, sr: int) -> float:
     if f0.size == 0:
         raise ValueError("Unable to estimate F0 from audio.")
     return float(np.median(f0))
+
+
+def _rms(audio: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+
+
+def _harmonic_ratio(audio: np.ndarray) -> float:
+    if not audio.size:
+        return 0.0
+    harmonic = librosa.effects.harmonic(audio)
+    return _rms(harmonic) / (_rms(audio) + 1e-6)
+
+
+def _mfcc_dtw_distance(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> float:
+    mfcc_ref = librosa.feature.mfcc(y=ref_audio, sr=sr, n_mfcc=13)
+    mfcc_out = librosa.feature.mfcc(y=out_audio, sr=sr, n_mfcc=13)
+    if mfcc_ref.size == 0 or mfcc_out.size == 0:
+        return float("inf")
+    _cost, wp = librosa.sequence.dtw(mfcc_ref.T, mfcc_out.T, metric="euclidean")
+    path = np.asarray(wp)
+    if path.size == 0:
+        return float("inf")
+    diffs = mfcc_ref[:, path[:, 0]] - mfcc_out[:, path[:, 1]]
+    dist = np.linalg.norm(diffs, axis=0)
+    return float(np.mean(dist))
 
 
 def _f0_contour(audio: np.ndarray, sr: int) -> np.ndarray:
@@ -106,6 +136,11 @@ def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str,
     centroid_ratio = centroid_out / centroid_ref if centroid_ref > 0 else 1.0
 
     f0_corr = _f0_correlation(_f0_contour(ref_trim, sr), _f0_contour(out_trim, sr))
+    mfcc_dtw = _mfcc_dtw_distance(ref_trim, out_trim, sr)
+    flat_out = float(np.mean(librosa.feature.spectral_flatness(y=out_trim)))
+    zcr_out = float(np.mean(librosa.feature.zero_crossing_rate(out_trim)))
+    harm_ratio = _harmonic_ratio(out_trim)
+    out_dur = len(out_trim) / sr
 
     return {
         "pitch_ratio": pitch_ratio,
@@ -114,6 +149,11 @@ def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str,
         "rms_ratio": rms_ratio,
         "centroid_ratio": centroid_ratio,
         "f0_corr": f0_corr,
+        "mfcc_dtw": mfcc_dtw,
+        "flat_out": flat_out,
+        "zcr_out": zcr_out,
+        "harm_ratio": harm_ratio,
+        "out_dur": out_dur,
     }
 
 
@@ -121,11 +161,24 @@ def _score(metrics: dict[str, float]) -> float:
     pitch_err = abs(np.log(metrics["pitch_ratio"])) if metrics["pitch_ratio"] > 0 else 1.0
     rms_err = abs(np.log(metrics["rms_ratio"])) if metrics["rms_ratio"] > 0 else 1.0
     centroid_err = abs(np.log(metrics["centroid_ratio"])) if metrics["centroid_ratio"] > 0 else 1.0
+    mcd = metrics.get("mfcc_dtw", 0.0)
+    flat_out = metrics.get("flat_out", 0.0)
+    zcr_out = metrics.get("zcr_out", 0.0)
+    harm_ratio = metrics.get("harm_ratio", 0.0)
+    out_dur = metrics.get("out_dur", 0.0)
+    dur_penalty = 0.0
+    if out_dur < 0.5:
+        dur_penalty = (0.5 - out_dur) * 4.0
     return (
         pitch_err
         + metrics["flat_diff"] * 2.0
         + rms_err * 0.2
         + centroid_err * 0.3
+        + (mcd * 0.02)
+        + (flat_out * 1.2)
+        + (zcr_out * 0.3)
+        + (1.0 - harm_ratio) * 0.6
+        + dur_penalty
         - metrics["mfcc_cos"] * 0.1
         - metrics["f0_corr"] * 0.1
     )
@@ -155,6 +208,29 @@ def _load_f0_scale(training_dir: Path, override: float | None) -> float:
     return 1.0
 
 
+def _epoch_index(checkpoint: str) -> int | None:
+    match = _EPOCH_RE.search(checkpoint)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _load_sample_rate(config_path: Path) -> int:
+    try:
+        config = yaml.safe_load(config_path.read_text())
+    except Exception:
+        return 24000
+    if not isinstance(config, dict):
+        return 24000
+    preprocess = config.get("preprocess_params", {})
+    if isinstance(preprocess, dict):
+        return int(preprocess.get("sr", 24000))
+    return 24000
+
+
 def _load_texts(path: Path | None) -> list[str]:
     if path is None:
         return []
@@ -177,11 +253,17 @@ def _rank_reference_wavs(ref_dir: Path) -> list[Path]:
             audio, _ = librosa.effects.trim(audio, top_db=35)
             if len(audio) < sr:
                 continue
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+            if rms < 0.01:
+                continue
             f0 = librosa.yin(audio, fmin=50, fmax=500, sr=sr)
             f0 = f0[np.isfinite(f0)]
-            if f0.size == 0:
+            if f0.size < 5:
                 continue
-            score = float(np.median(f0))
+            f0_median = float(np.median(f0))
+            f0_std = float(np.std(f0))
+            flat = float(np.mean(librosa.feature.spectral_flatness(y=audio)))
+            score = f0_median + (flat * 300.0) + (f0_std / 50.0) - (rms * 20.0)
             scored.append((score, path))
         except Exception:
             continue
@@ -210,8 +292,40 @@ def main() -> None:
     parser.add_argument("--diffusion_steps", type=int, help="Override diffusion steps.")
     parser.add_argument("--embedding_scale", type=float, help="Override embedding scale.")
     parser.add_argument("--save_best", action="store_true", help="Save best sample wav.")
+    parser.add_argument("--use_resemblyzer", action="store_true", help="Include speaker similarity score.")
+    parser.add_argument(
+        "--quality_top_n",
+        type=int,
+        default=5,
+        help="Only run speaker similarity on the top N quality checkpoints.",
+    )
+    parser.add_argument(
+        "--identity_margin",
+        type=float,
+        default=0.02,
+        help="Prefer earlier epochs within this identity margin of the best.",
+    )
+    parser.add_argument(
+        "--score_margin",
+        type=float,
+        default=0.15,
+        help="Pick earliest epoch within this score margin of the best.",
+    )
+    parser.add_argument(
+        "--no_prefer_earlier",
+        action="store_false",
+        dest="prefer_earlier",
+        help="Disable early-epoch preference.",
+    )
+    parser.add_argument(
+        "--report_top",
+        type=int,
+        default=5,
+        help="Print the top N checkpoints by score.",
+    )
     parser.add_argument("--phonemizer_lang", type=str, help="Override phonemizer language.")
     parser.add_argument("--lexicon_path", type=Path, help="Lexicon JSON for phoneme overrides.")
+    parser.set_defaults(prefer_earlier=True)
 
     args = parser.parse_args()
 
@@ -244,6 +358,17 @@ def main() -> None:
     lexicon_path = args.lexicon_path or profile.get("lexicon_path")
     lexicon = _load_lexicon(Path(lexicon_path)) if lexicon_path else None
 
+    speaker_encoder = None
+    preprocess_wav = None
+    ref_embed_cache: dict[str, np.ndarray] = {}
+    if args.use_resemblyzer:
+        try:
+            from resemblyzer import VoiceEncoder, preprocess_wav as _preprocess_wav
+        except Exception as exc:
+            raise RuntimeError("Resemblyzer not installed. Run `pip install resemblyzer`.") from exc
+        speaker_encoder = VoiceEncoder()
+        preprocess_wav = _preprocess_wav
+
     texts = _load_texts(args.probe_texts)
     if not texts:
         texts = DEFAULT_PROBE_TEXTS if args.thorough else [args.text]
@@ -271,8 +396,11 @@ def main() -> None:
     if not ref_wavs:
         raise FileNotFoundError("No reference wavs found. Provide --ref_wav or --ref_dir.")
 
-    best = None
     results = []
+    store_audio = args.save_best or args.use_resemblyzer
+    best_audio_by_ckpt = {} if store_audio else None
+    best_ref_by_ckpt = {} if store_audio else None
+    sample_rate = _load_sample_rate(config_path)
 
     print(f"Evaluating {len(checkpoints)} checkpoints...")
     print(f"alpha={alpha} beta={beta} diffusion={diffusion_steps} embedding={embedding_scale} f0_scale={f0_scale}")
@@ -287,10 +415,16 @@ def main() -> None:
             "rms_ratio": [],
             "centroid_ratio": [],
             "f0_corr": [],
+            "mfcc_dtw": [],
+            "flat_out": [],
+            "zcr_out": [],
+            "harm_ratio": [],
+            "out_dur": [],
         }
         failures = 0
         best_sample = None
         best_sample_score = None
+        best_sample_ref = None
         for ref_path in ref_wavs:
             ref_audio = _load_mono(ref_path, engine.sample_rate)
             for text in texts:
@@ -314,6 +448,7 @@ def main() -> None:
                     if best_sample_score is None or score < best_sample_score:
                         best_sample_score = score
                         best_sample = audio
+                        best_sample_ref = ref_path
                 except Exception:
                     failures += 1
                     continue
@@ -327,19 +462,76 @@ def main() -> None:
             "score": score,
             "metrics": summary,
             "failures": failures,
+            "epoch_index": _epoch_index(str(ckpt)),
         }
         results.append(entry)
-        if best is None or score < best["score"]:
-            best = entry
-            best_audio = best_sample
+        if best_audio_by_ckpt is not None and best_sample is not None:
+            best_audio_by_ckpt[str(ckpt)] = best_sample
+            best_ref_by_ckpt[str(ckpt)] = best_sample_ref or ref_wavs[0]
 
         del engine
         torch.cuda.empty_cache()
 
-    if best is None:
+    if not results:
         raise RuntimeError("No checkpoints evaluated.")
-    if best_audio is None:
-        raise RuntimeError("No audio samples generated during epoch selection.")
+
+    results_sorted = sorted(results, key=lambda item: item["score"])
+    best = results_sorted[0]
+    if args.prefer_earlier and args.score_margin is not None and args.score_margin >= 0:
+        cutoff = best["score"] + args.score_margin
+        candidates = [item for item in results_sorted if item["score"] <= cutoff]
+        if candidates:
+            candidates.sort(
+                key=lambda item: (
+                    item["epoch_index"] is None,
+                    item["epoch_index"] if item["epoch_index"] is not None else 0,
+                )
+            )
+            best = candidates[0]
+
+    if args.use_resemblyzer and speaker_encoder is not None and preprocess_wav is not None:
+        top_n = max(1, args.quality_top_n)
+        candidates = results_sorted[:top_n]
+        for entry in candidates:
+            ckpt = entry["checkpoint"]
+            audio = best_audio_by_ckpt.get(ckpt) if best_audio_by_ckpt else None
+            ref_path = best_ref_by_ckpt.get(ckpt) if best_ref_by_ckpt else None
+            if audio is None or ref_path is None:
+                entry["spk_sim"] = 0.0
+                continue
+            cache_key = str(ref_path)
+            if cache_key in ref_embed_cache:
+                ref_embed = ref_embed_cache[cache_key]
+            else:
+                ref_embed = speaker_encoder.embed_utterance(preprocess_wav(str(ref_path)))
+                ref_embed_cache[cache_key] = ref_embed
+            out_wav = preprocess_wav(audio.astype(np.float32), source_sr=sample_rate)
+            out_embed = speaker_encoder.embed_utterance(out_wav)
+            denom = (np.linalg.norm(ref_embed) * np.linalg.norm(out_embed)) or 1.0
+            entry["spk_sim"] = float(np.dot(ref_embed, out_embed) / denom)
+
+        candidates = [c for c in candidates if "spk_sim" in c]
+        if candidates:
+            best_sim = max(c["spk_sim"] for c in candidates)
+            if args.prefer_earlier:
+                margin = max(0.0, args.identity_margin)
+                within = [c for c in candidates if c["spk_sim"] >= best_sim - margin]
+                within.sort(
+                    key=lambda item: (
+                        item["epoch_index"] is None,
+                        item["epoch_index"] if item["epoch_index"] is not None else 0,
+                        item["score"],
+                    )
+                )
+                best = within[0] if within else max(candidates, key=lambda c: c["spk_sim"])
+            else:
+                best = max(candidates, key=lambda c: c["spk_sim"])
+
+    best_audio = None
+    if best_audio_by_ckpt is not None:
+        best_audio = best_audio_by_ckpt.get(best["checkpoint"])
+        if best_audio is None:
+            raise RuntimeError("No audio samples generated during epoch selection.")
 
     best_path = training_dir / "best_epoch.txt"
     best_path.write_text(best["checkpoint"] + "\n")
@@ -348,10 +540,24 @@ def main() -> None:
     results_path.write_text(json.dumps(results, indent=2))
 
     print(f"Best checkpoint: {best['checkpoint']} (score {best['score']:.5f})")
+    top_n = max(0, args.report_top)
+    if top_n:
+        print("Top checkpoints:")
+        for entry in results_sorted[:top_n]:
+            epoch_label = entry.get("epoch_index")
+            epoch_display = f"{epoch_label:04d}" if isinstance(epoch_label, int) else "unknown"
+            spk_sim = entry.get("spk_sim")
+            if spk_sim is None:
+                print(f"  epoch {epoch_display}  score {entry['score']:.5f}  {entry['checkpoint']}")
+            else:
+                print(
+                    f"  epoch {epoch_display}  score {entry['score']:.5f}  spk {spk_sim:.4f}  "
+                    f"{entry['checkpoint']}"
+                )
     print(f"Wrote {best_path}")
     print(f"Wrote {results_path}")
 
-    if args.save_best:
+    if args.save_best and best_audio is not None:
         out_dir = training_dir.parents[1] / "inference" / training_dir.name
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{Path(best['checkpoint']).stem}_best.wav"

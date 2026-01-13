@@ -4,6 +4,7 @@ import math
 import json
 import io
 import os
+import random
 import re
 import sys
 import threading
@@ -41,7 +42,7 @@ DEFAULT_BETA = 0.1
 DEFAULT_DIFFUSION_STEPS = 10
 DEFAULT_EMBEDDING_SCALE = 1.5
 DEFAULT_F0_SCALE = 1.0
-DEFAULT_LANG = "en-us"
+DEFAULT_LANG = "en-ca"
 
 _WORD_RE = re.compile(r"[A-Za-z']+|[^A-Za-z']+")
 _WORD_ONLY_RE = re.compile(r"[A-Za-z']+$")
@@ -69,6 +70,29 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
         wf.writeframes(pcm16.tobytes())
 
     return buffer.getvalue()
+
+
+def _apply_pitch_shift(
+    audio: np.ndarray,
+    sample_rate: int,
+    semitones: float,
+) -> np.ndarray:
+    if semitones == 0:
+        return audio
+    try:
+        import librosa
+    except Exception as exc:
+        raise RuntimeError("Missing librosa for pitch shifting.") from exc
+    shifted = librosa.effects.pitch_shift(audio.astype(np.float32), sr=sample_rate, n_steps=semitones)
+    return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _resolve_path(base_dir: Path, value: str | None) -> Path | None:
@@ -274,6 +298,8 @@ class GenerateRequest(BaseModel):
     diffusion_steps: int | None = None
     embedding_scale: float | None = None
     f0_scale: float | None = None
+    pitch_shift: float | None = None
+    seed: int | None = None
     return_base64: bool = False
 
 
@@ -464,10 +490,13 @@ class StyleTTS2RepoEngine:
         f0_scale: float,
         phonemizer_lang: str | None = None,
         lexicon: dict[str, str] | None = None,
+        seed: int | None = None,
     ) -> np.ndarray:
         text = text.strip()
         if not text:
             raise ValueError("Text is empty.")
+        if seed is not None:
+            _seed_everything(seed)
 
         phonemes = self._phonemize(text, phonemizer_lang, lexicon)
         tokens = " ".join(self._tokenize(phonemes))
@@ -593,7 +622,10 @@ def generate(req: GenerateRequest):
             f0_scale=params["f0_scale"],
             phonemizer_lang=phonemizer_lang,
             lexicon=lexicon,
+            seed=req.seed,
         )
+        if req.pitch_shift is not None and req.pitch_shift != 0:
+            audio = _apply_pitch_shift(audio, engine.sample_rate, req.pitch_shift)
     except HTTPException:
         raise
     except Exception as exc:

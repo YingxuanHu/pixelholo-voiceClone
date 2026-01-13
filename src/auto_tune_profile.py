@@ -64,6 +64,31 @@ def _median_f0(audio: np.ndarray, sr: int) -> float:
     return float(np.median(f0))
 
 
+def _rms(audio: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+
+
+def _harmonic_ratio(audio: np.ndarray) -> float:
+    if not audio.size:
+        return 0.0
+    harmonic = librosa.effects.harmonic(audio)
+    return _rms(harmonic) / (_rms(audio) + 1e-6)
+
+
+def _mfcc_dtw_distance(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> float:
+    mfcc_ref = librosa.feature.mfcc(y=ref_audio, sr=sr, n_mfcc=13)
+    mfcc_out = librosa.feature.mfcc(y=out_audio, sr=sr, n_mfcc=13)
+    if mfcc_ref.size == 0 or mfcc_out.size == 0:
+        return float("inf")
+    _cost, wp = librosa.sequence.dtw(mfcc_ref.T, mfcc_out.T, metric="euclidean")
+    path = np.asarray(wp)
+    if path.size == 0:
+        return float("inf")
+    diffs = mfcc_ref[:, path[:, 0]] - mfcc_out[:, path[:, 1]]
+    dist = np.linalg.norm(diffs, axis=0)
+    return float(np.mean(dist))
+
+
 def _f0_contour(audio: np.ndarray, sr: int) -> np.ndarray:
     f0 = librosa.yin(audio, fmin=50, fmax=500, sr=sr)
     f0 = f0[np.isfinite(f0)]
@@ -115,6 +140,11 @@ def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str,
     centroid_ratio = centroid_out / centroid_ref if centroid_ref > 0 else 1.0
 
     f0_corr = _f0_correlation(_f0_contour(ref_trim, sr), _f0_contour(out_trim, sr))
+    mfcc_dtw = _mfcc_dtw_distance(ref_trim, out_trim, sr)
+    flat_out = float(np.mean(librosa.feature.spectral_flatness(y=out_trim)))
+    zcr_out = float(np.mean(librosa.feature.zero_crossing_rate(out_trim)))
+    harm_ratio = _harmonic_ratio(out_trim)
+    out_dur = len(out_trim) / sr
 
     return {
         "pitch_ratio": pitch_ratio,
@@ -123,6 +153,11 @@ def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str,
         "rms_ratio": rms_ratio,
         "centroid_ratio": centroid_ratio,
         "f0_corr": f0_corr,
+        "mfcc_dtw": mfcc_dtw,
+        "flat_out": flat_out,
+        "zcr_out": zcr_out,
+        "harm_ratio": harm_ratio,
+        "out_dur": out_dur,
     }
 
 
@@ -130,11 +165,24 @@ def _score(metrics: dict[str, float]) -> float:
     pitch_err = abs(np.log(metrics["pitch_ratio"])) if metrics["pitch_ratio"] > 0 else 1.0
     rms_err = abs(np.log(metrics["rms_ratio"])) if metrics["rms_ratio"] > 0 else 1.0
     centroid_err = abs(np.log(metrics["centroid_ratio"])) if metrics["centroid_ratio"] > 0 else 1.0
+    mcd = metrics.get("mfcc_dtw", 0.0)
+    flat_out = metrics.get("flat_out", 0.0)
+    zcr_out = metrics.get("zcr_out", 0.0)
+    harm_ratio = metrics.get("harm_ratio", 0.0)
+    out_dur = metrics.get("out_dur", 0.0)
+    dur_penalty = 0.0
+    if out_dur < 0.5:
+        dur_penalty = (0.5 - out_dur) * 4.0
     return (
         pitch_err
         + metrics["flat_diff"] * 2.0
         + rms_err * 0.2
         + centroid_err * 0.3
+        + (mcd * 0.02)
+        + (flat_out * 1.2)
+        + (zcr_out * 0.3)
+        + (1.0 - harm_ratio) * 0.6
+        + dur_penalty
         - metrics["mfcc_cos"] * 0.1
         - metrics["f0_corr"] * 0.1
     )
@@ -150,6 +198,89 @@ def _parse_int_list(value: str | None, default: list[int]) -> list[int]:
     if not value:
         return default
     return [int(x.strip()) for x in value.split(",") if x.strip()]
+
+
+def _evaluate_grid(
+    engine: StyleTTS2RepoEngine,
+    ref_wavs: list[Path],
+    texts: list[str],
+    alphas: list[float],
+    betas: list[float],
+    diffusions: list[int],
+    embeddings: list[float],
+    f0_scale: float,
+    phonemizer_lang: str | None,
+    lexicon: dict[str, str] | None,
+) -> tuple[dict, np.ndarray | None]:
+    best = None
+    best_audio = None
+    for alpha in alphas:
+        for beta in betas:
+            for diffusion_steps in diffusions:
+                for embedding_scale in embeddings:
+                    all_metrics: dict[str, list[float]] = {
+                        "pitch_ratio": [],
+                        "mfcc_cos": [],
+                        "flat_diff": [],
+                        "rms_ratio": [],
+                        "centroid_ratio": [],
+                        "f0_corr": [],
+                        "mfcc_dtw": [],
+                        "flat_out": [],
+                        "zcr_out": [],
+                        "harm_ratio": [],
+                        "out_dur": [],
+                    }
+                    failures = 0
+                    best_sample = None
+                    best_sample_score = None
+                    for ref_path in ref_wavs:
+                        ref_audio = _load_mono(ref_path, engine.sample_rate)
+                        for text in texts:
+                            try:
+                                audio = engine.generate(
+                                    text,
+                                    ref_wav_path=ref_path,
+                                    alpha=alpha,
+                                    beta=beta,
+                                    diffusion_steps=diffusion_steps,
+                                    embedding_scale=embedding_scale,
+                                    f0_scale=f0_scale,
+                                    phonemizer_lang=phonemizer_lang,
+                                    lexicon=lexicon,
+                                )
+                                metrics = _metrics(ref_audio, audio, engine.sample_rate)
+                                score = _score(metrics)
+                                for key, value in metrics.items():
+                                    if np.isfinite(value):
+                                        all_metrics[key].append(float(value))
+                                if best_sample_score is None or score < best_sample_score:
+                                    best_sample_score = score
+                                    best_sample = audio
+                            except Exception:
+                                failures += 1
+                                continue
+
+                    summary = {}
+                    for key, values in all_metrics.items():
+                        summary[key] = float(np.mean(values)) if values else 0.0
+                    score = _score(summary) + (failures * 0.5)
+                    record = {
+                        "alpha": alpha,
+                        "beta": beta,
+                        "diffusion_steps": diffusion_steps,
+                        "embedding_scale": embedding_scale,
+                        "f0_scale": f0_scale,
+                        "metrics": summary,
+                        "score": score,
+                        "failures": failures,
+                    }
+                    if best is None or score < best["score"]:
+                        best = record
+                        best_audio = best_sample
+    if best is None:
+        raise RuntimeError("No candidates evaluated.")
+    return best, best_audio
 
 
 def _load_texts(path: Path | None) -> list[str]:
@@ -174,11 +305,17 @@ def _rank_reference_wavs(ref_dir: Path) -> list[Path]:
             audio, _ = librosa.effects.trim(audio, top_db=35)
             if len(audio) < sr:
                 continue
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+            if rms < 0.01:
+                continue
             f0 = librosa.yin(audio, fmin=50, fmax=500, sr=sr)
             f0 = f0[np.isfinite(f0)]
-            if f0.size == 0:
+            if f0.size < 5:
                 continue
-            score = float(np.median(f0))
+            f0_median = float(np.median(f0))
+            f0_std = float(np.std(f0))
+            flat = float(np.mean(librosa.feature.spectral_flatness(y=audio)))
+            score = f0_median + (flat * 300.0) + (f0_std / 50.0) - (rms * 20.0)
             scored.append((score, path))
         except Exception:
             continue
@@ -206,6 +343,58 @@ def main() -> None:
     parser.add_argument("--diffusions", help="Comma-separated diffusion steps.")
     parser.add_argument("--embeddings", help="Comma-separated embedding scales.")
     parser.add_argument("--save_best", action="store_true", help="Save best sample wav.")
+    parser.add_argument(
+        "--adaptive",
+        action="store_true",
+        default=True,
+        help="Adapt alpha/beta ranges using metrics.",
+    )
+    parser.add_argument(
+        "--no_adaptive",
+        action="store_false",
+        dest="adaptive",
+        help="Disable adaptive tuning.",
+    )
+    parser.add_argument(
+        "--f0_corr_floor",
+        type=float,
+        default=0.2,
+        help="If f0_corr is below this, expand beta range upward.",
+    )
+    parser.add_argument(
+        "--mfcc_cos_ceiling",
+        type=float,
+        default=0.95,
+        help="If mfcc_cos exceeds this, expand alpha range upward.",
+    )
+    parser.add_argument(
+        "--centroid_ratio_ceiling",
+        type=float,
+        default=1.02,
+        help="If centroid_ratio exceeds this, expand search toward lower embedding/diffusion.",
+    )
+    parser.add_argument(
+        "--target_f0_hz",
+        type=float,
+        help="Target median F0 in Hz (e.g., 100 for a deeper male voice).",
+    )
+    parser.add_argument(
+        "--male_voice",
+        action="store_true",
+        help="Convenience flag to target a deeper male F0 (~100 Hz).",
+    )
+    parser.add_argument(
+        "--f0_scale_min",
+        type=float,
+        default=0.6,
+        help="Clamp the final f0_scale to at least this value.",
+    )
+    parser.add_argument(
+        "--f0_scale_max",
+        type=float,
+        default=1.2,
+        help="Clamp the final f0_scale to at most this value.",
+    )
     parser.add_argument("--phonemizer_lang", type=str, help="Override phonemizer language.")
     parser.add_argument("--lexicon_path", type=Path, help="Lexicon JSON for phoneme overrides.")
 
@@ -286,6 +475,7 @@ def main() -> None:
     # First pass to estimate f0_scale.
     probe_text = texts[0]
     f0_scales = []
+    ref_f0s = []
     for ref_path in ref_wavs:
         ref_audio = _load_mono(ref_path, sr)
         probe_audio = engine.generate(
@@ -302,72 +492,63 @@ def main() -> None:
         f0_ref = _median_f0(_trim(ref_audio), sr)
         f0_out = _median_f0(_trim(probe_audio), sr)
         f0_scales.append(1.0 / (f0_out / f0_ref))
+        ref_f0s.append(f0_ref)
 
     f0_scale = float(np.median(f0_scales)) if f0_scales else 1.0
+    ref_f0_median = float(np.median(ref_f0s)) if ref_f0s else None
+    target_f0 = args.target_f0_hz
+    if target_f0 is None and args.male_voice:
+        target_f0 = 100.0
+    if target_f0 and ref_f0_median:
+        target_scale = target_f0 / ref_f0_median
+        f0_scale *= target_scale
+        f0_scale = max(args.f0_scale_min, min(args.f0_scale_max, f0_scale))
+        print(
+            f"Adjusted f0_scale for target F0 {target_f0:.1f} Hz "
+            f"(ref median {ref_f0_median:.1f} Hz): {f0_scale:.4f}"
+        )
 
     print(f"Estimated f0_scale: {f0_scale:.4f}")
 
-    best = None
-    best_audio = None
-    for alpha in alphas:
-        for beta in betas:
-            for diffusion_steps in diffusions:
-                for embedding_scale in embeddings:
-                    all_metrics: dict[str, list[float]] = {
-                        "pitch_ratio": [],
-                        "mfcc_cos": [],
-                        "flat_diff": [],
-                        "rms_ratio": [],
-                        "centroid_ratio": [],
-                        "f0_corr": [],
-                    }
-                    failures = 0
-                    best_sample = None
-                    best_sample_score = None
-                    for ref_path in ref_wavs:
-                        ref_audio = _load_mono(ref_path, sr)
-                        for text in texts:
-                            try:
-                                audio = engine.generate(
-                                    text,
-                                    ref_wav_path=ref_path,
-                                    alpha=alpha,
-                                    beta=beta,
-                                    diffusion_steps=diffusion_steps,
-                                    embedding_scale=embedding_scale,
-                                    f0_scale=f0_scale,
-                                    phonemizer_lang=args.phonemizer_lang,
-                                    lexicon=lexicon,
-                                )
-                                metrics = _metrics(ref_audio, audio, sr)
-                                score = _score(metrics)
-                                for key, value in metrics.items():
-                                    if np.isfinite(value):
-                                        all_metrics[key].append(float(value))
-                                if best_sample_score is None or score < best_sample_score:
-                                    best_sample_score = score
-                                    best_sample = audio
-                            except Exception:
-                                failures += 1
-                                continue
+    best, best_audio = _evaluate_grid(
+        engine=engine,
+        ref_wavs=ref_wavs,
+        texts=texts,
+        alphas=alphas,
+        betas=betas,
+        diffusions=diffusions,
+        embeddings=embeddings,
+        f0_scale=f0_scale,
+        phonemizer_lang=args.phonemizer_lang,
+        lexicon=lexicon,
+    )
 
-                    summary = {}
-                    for key, values in all_metrics.items():
-                        summary[key] = float(np.mean(values)) if values else 0.0
-                    score = _score(summary) + (failures * 0.5)
-                    record = {
-                        "alpha": alpha,
-                        "beta": beta,
-                        "diffusion_steps": diffusion_steps,
-                        "embedding_scale": embedding_scale,
-                        "f0_scale": f0_scale,
-                        "metrics": summary,
-                        "score": score,
-                        "failures": failures,
-                    }
-                    if best is None or score < best["score"]:
-                        best = record
-                        best_audio = best_sample
+    if args.adaptive:
+        adaptive = {}
+        if best["metrics"].get("f0_corr", 1.0) < args.f0_corr_floor:
+            betas = sorted(set(betas + [0.6, 0.8, 0.9]))
+            adaptive["beta"] = "expanded"
+        if best["metrics"].get("mfcc_cos", 0.0) > args.mfcc_cos_ceiling:
+            alphas = sorted(set(alphas + [0.6, 0.8]))
+            adaptive["alpha"] = "expanded"
+        if best["metrics"].get("centroid_ratio", 0.0) > args.centroid_ratio_ceiling:
+            embeddings = sorted(set(embeddings + [0.8, 0.9, 1.0, 1.1]))
+            diffusions = sorted(set(diffusions + [8, 10, 12, 15]))
+            adaptive["sharpness"] = "reduced"
+        if adaptive:
+            print(f"Adaptive tuning triggered: {adaptive}")
+            best, best_audio = _evaluate_grid(
+                engine=engine,
+                ref_wavs=ref_wavs,
+                texts=texts,
+                alphas=alphas,
+                betas=betas,
+                diffusions=diffusions,
+                embeddings=embeddings,
+                f0_scale=f0_scale,
+                phonemizer_lang=args.phonemizer_lang,
+                lexicon=lexicon,
+            )
 
     if best is None:
         raise RuntimeError("No candidates evaluated.")

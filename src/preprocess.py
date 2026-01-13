@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from pydub import AudioSegment
-from pydub.silence import split_on_silence
+from pydub.silence import detect_nonsilent, split_on_silence
 from faster_whisper import WhisperModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +25,7 @@ from config import (  # noqa: E402
     DEFAULT_MIN_AVG_LOGPROB,
     DEFAULT_MIN_CHUNK_DBFS,
     DEFAULT_MIN_WORDS,
+    DEFAULT_MIN_SPEECH_RATIO,
     DEFAULT_SAMPLE_RATE,
     DEFAULT_VAD_FILTER,
     KEEP_SILENCE_MS,
@@ -175,12 +176,26 @@ def _chunk_is_usable(
     chunk: AudioSegment,
     min_chunk_dbfs: float | None,
     max_clip_dbfs: float | None,
+    min_speech_ratio: float | None,
 ) -> bool:
     if min_chunk_dbfs is not None:
         if chunk.dBFS == float("-inf") or chunk.dBFS < min_chunk_dbfs:
             return False
     if max_clip_dbfs is not None and chunk.max_dBFS > max_clip_dbfs:
         return False
+    if min_speech_ratio is not None and len(chunk) > 0:
+        silence_thresh = (
+            chunk.dBFS + SILENCE_THRESH_DB if chunk.dBFS != float("-inf") else SILENCE_THRESH_DB
+        )
+        nonsilent = detect_nonsilent(
+            chunk,
+            min_silence_len=max(200, SILENCE_MIN_LEN_MS // 2),
+            silence_thresh=silence_thresh,
+        )
+        nonsilent_ms = sum(end - start for start, end in nonsilent) if nonsilent else 0
+        ratio = nonsilent_ms / len(chunk) if len(chunk) else 0.0
+        if ratio < min_speech_ratio:
+            return False
     return True
 
 
@@ -199,6 +214,7 @@ def process_video(
     denoise: bool = DEFAULT_DENOISE,
     min_chunk_dbfs: float | None = DEFAULT_MIN_CHUNK_DBFS,
     max_clip_dbfs: float | None = DEFAULT_MAX_CLIP_DBFS,
+    min_speech_ratio: float | None = DEFAULT_MIN_SPEECH_RATIO,
     legacy_split: bool = False,
     quiet: bool = False,
 ) -> Path:
@@ -271,7 +287,7 @@ def process_video(
                 if end_ms <= start_ms:
                     continue
                 chunk = audio[start_ms:end_ms]
-                if not _chunk_is_usable(chunk, min_chunk_dbfs, max_clip_dbfs):
+                if not _chunk_is_usable(chunk, min_chunk_dbfs, max_clip_dbfs, min_speech_ratio):
                     continue
                 chunk_name = f"{speaker_name}_{chunk_index:04d}.wav"
                 chunk_path = wavs_dir / chunk_name
@@ -308,7 +324,7 @@ def process_video(
 
             _log(f"Transcribing {len(filtered_chunks)} chunks...")
             for chunk in filtered_chunks:
-                if not _chunk_is_usable(chunk, min_chunk_dbfs, max_clip_dbfs):
+                if not _chunk_is_usable(chunk, min_chunk_dbfs, max_clip_dbfs, min_speech_ratio):
                     continue
                 chunk_name = f"{speaker_name}_{chunk_index:04d}.wav"
                 chunk_path = wavs_dir / chunk_name
@@ -358,6 +374,7 @@ def main() -> None:
     parser.add_argument("--denoise", action="store_true", default=DEFAULT_DENOISE)
     parser.add_argument("--min_chunk_dbfs", type=float, default=DEFAULT_MIN_CHUNK_DBFS)
     parser.add_argument("--max_clip_dbfs", type=float, default=DEFAULT_MAX_CLIP_DBFS)
+    parser.add_argument("--min_speech_ratio", type=float, default=DEFAULT_MIN_SPEECH_RATIO)
     parser.add_argument("--legacy_split", action="store_true", help="Use silence split before transcription")
     parser.add_argument("--quiet", action="store_true", help="Reduce preprocessing logs")
 
@@ -381,6 +398,7 @@ def main() -> None:
         denoise=args.denoise,
         min_chunk_dbfs=args.min_chunk_dbfs,
         max_clip_dbfs=args.max_clip_dbfs,
+        min_speech_ratio=args.min_speech_ratio,
         legacy_split=args.legacy_split,
         quiet=args.quiet,
     )

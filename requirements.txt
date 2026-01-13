@@ -13,3 +13,4 @@ phonemizer
 nltk
 soundfile
 transformers
+resemblyzer

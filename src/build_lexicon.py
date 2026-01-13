@@ -31,7 +31,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build a default lexicon.json for a profile.")
     parser.add_argument("--profile", help="Profile name (uses data/<profile>/metadata.csv).")
     parser.add_argument("--metadata", type=Path, help="Path to metadata.csv.")
-    parser.add_argument("--lang", default="en-us", help="Phonemizer language (default: en-us).")
+    parser.add_argument("--lang", default="en-ca", help="Phonemizer language (default: en-ca).")
     parser.add_argument("--min_count", type=int, default=1, help="Only include words seen N times.")
     parser.add_argument("--output", type=Path, help="Output lexicon.json path.")
     args = parser.parse_args()

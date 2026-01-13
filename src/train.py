@@ -26,6 +26,7 @@ from config import (  # noqa: E402
     DEFAULT_EPOCHS,
     DEFAULT_FP16,
     DEFAULT_MAX_LEN,
+    DEFAULT_MIN_SPEECH_RATIO,
     METADATA_FILENAME,
     PROCESSED_WAVS_DIRNAME,
     STYLE_TTS2_DIR,
@@ -35,6 +36,17 @@ from config import (  # noqa: E402
 def _latest_checkpoint(output_dir: Path) -> Path | None:
     checkpoints = sorted(output_dir.glob("epoch_2nd_*.pth"))
     return checkpoints[-1] if checkpoints else None
+
+
+def _best_checkpoint(output_dir: Path) -> Path | None:
+    best_path = output_dir / "best_epoch.txt"
+    if best_path.exists():
+        content = best_path.read_text().strip()
+        if content:
+            candidate = Path(content)
+            if candidate.exists():
+                return candidate
+    return None
 
 
 def _auto_pick_ref_wav(dataset_root: Path) -> Path | None:
@@ -59,11 +71,17 @@ def _auto_pick_ref_wav(dataset_root: Path) -> Path | None:
             audio, _ = librosa.effects.trim(audio, top_db=35)
             if len(audio) < sr:
                 continue
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+            if rms < 0.01:
+                continue
             f0 = librosa.yin(audio, fmin=50, fmax=500, sr=sr)
             f0 = f0[np.isfinite(f0)]
-            if f0.size == 0:
+            if f0.size < 5:
                 continue
-            score = float(np.median(f0))
+            f0_median = float(np.median(f0))
+            f0_std = float(np.std(f0))
+            flat = float(np.mean(librosa.feature.spectral_flatness(y=audio)))
+            score = f0_median + (flat * 300.0) + (f0_std / 50.0) - (rms * 20.0)
             if best is None or score < best[0]:
                 best = (score, path)
         except Exception:
@@ -89,14 +107,38 @@ def _load_base_config(styletts2_dir: Path, base_config: Path | None) -> tuple[di
     return config, config_path
 
 
+def _normalize_text(text: str) -> str:
+    return " ".join(text.split()).strip()
+
+
 def _write_train_val_lists(
     meta_path: Path,
     output_dir: Path,
     val_ratio: float,
     seed: int,
+    max_text_chars: int | None,
+    max_text_words: int | None,
 ) -> tuple[Path, Path, Path]:
     with meta_path.open("r") as handle:
         rows = [line.strip().split("|") for line in handle if line.strip()]
+
+    filtered: list[list[str]] = []
+    skipped = 0
+    for row in rows:
+        if len(row) < 2:
+            skipped += 1
+            continue
+        filename, text = row[0], _normalize_text(row[1])
+        if max_text_chars and len(text) > max_text_chars:
+            skipped += 1
+            continue
+        if max_text_words and len(text.split()) > max_text_words:
+            skipped += 1
+            continue
+        speaker = row[2] if len(row) > 2 else "0"
+        filtered.append([filename, text, speaker])
+
+    rows = filtered
 
     random.Random(seed).shuffle(rows)
     split_idx = max(1, int(len(rows) * (1.0 - val_ratio)))
@@ -120,6 +162,9 @@ def _write_train_val_lists(
     with ood_list.open("w") as handle:
         for line in ood_lines:
             handle.write(f"{line}\n")
+
+    if skipped:
+        print(f"Skipped {skipped} metadata rows due to max_text limits.")
 
     return train_list, val_list, ood_list
 
@@ -212,6 +257,18 @@ def main() -> None:
     parser.add_argument("--use_accelerate", action="store_true")
     parser.add_argument("--max_steps", type=int, help="Stop after this many training steps")
     parser.add_argument("--grad_accum_steps", type=int, help="Gradient accumulation steps")
+    parser.add_argument(
+        "--max_text_chars",
+        type=int,
+        default=400,
+        help="Drop samples with text longer than this many characters.",
+    )
+    parser.add_argument(
+        "--max_text_words",
+        type=int,
+        default=80,
+        help="Drop samples with text longer than this many words.",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Only write config, do not start training")
     parser.add_argument(
         "--auto_tune_profile",
@@ -229,6 +286,10 @@ def main() -> None:
     )
     parser.add_argument("--tune_probe_texts", type=Path, help="Text file with prompts for tuning")
     parser.add_argument("--tune_thorough", action="store_true", help="Use multiple refs/texts for tuning")
+    parser.add_argument("--tune_target_f0_hz", type=float, help="Target median F0 for tuning.")
+    parser.add_argument("--tune_male_voice", action="store_true", help="Target deeper male F0 for tuning.")
+    parser.add_argument("--tune_f0_scale_min", type=float, help="Minimum f0_scale clamp for tuning.")
+    parser.add_argument("--tune_f0_scale_max", type=float, help="Maximum f0_scale clamp for tuning.")
     parser.add_argument(
         "--tune_quick",
         action="store_true",
@@ -261,7 +322,7 @@ def main() -> None:
         action="store_true",
         help="After training, generate data/<profile>/lexicon.json from metadata.csv.",
     )
-    parser.add_argument("--lexicon_lang", type=str, default="en-us", help="Phonemizer language for lexicon")
+    parser.add_argument("--lexicon_lang", type=str, default="en-ca", help="Phonemizer language for lexicon")
     parser.add_argument("--lexicon_min_count", type=int, default=1, help="Minimum word count for lexicon")
 
     args = parser.parse_args()
@@ -295,6 +356,8 @@ def main() -> None:
         output_dir=output_dir,
         val_ratio=args.val_ratio,
         seed=args.seed,
+        max_text_chars=args.max_text_chars,
+        max_text_words=args.max_text_words,
     )
 
     config, base_config_path = _load_base_config(args.styletts2_dir, args.base_config)
@@ -340,32 +403,6 @@ def main() -> None:
         if auto_ref:
             print(f"Auto-picked reference wav: {auto_ref}")
 
-    if args.auto_tune_profile:
-        tune_script = PROJECT_ROOT / "src" / "auto_tune_profile.py"
-        command = [
-            sys.executable,
-            str(tune_script),
-            "--model_path",
-            str(latest_ckpt),
-            "--config_path",
-            str(output_config_path),
-            "--text",
-            args.tune_text,
-            "--save_best",
-        ]
-        if args.tune_probe_texts:
-            command += ["--probe_texts", str(args.tune_probe_texts)]
-        if args.tune_ref_dir:
-            command += ["--ref_dir", str(args.tune_ref_dir)]
-        if args.tune_ref_count:
-            command += ["--ref_count", str(args.tune_ref_count)]
-        if args.tune_thorough:
-            command.append("--thorough")
-        ref = args.tune_ref_wav or auto_ref
-        if ref:
-            command += ["--ref_wav", str(ref)]
-        subprocess.run(command, check=True)
-
     if args.auto_select_epoch:
         select_script = PROJECT_ROOT / "src" / "auto_select_epoch.py"
         command = [
@@ -390,6 +427,41 @@ def main() -> None:
         if args.select_limit is not None:
             command += ["--limit", str(args.select_limit)]
         ref = args.select_ref_wav or args.tune_ref_wav or auto_ref
+        if ref:
+            command += ["--ref_wav", str(ref)]
+        subprocess.run(command, check=True)
+
+    if args.auto_tune_profile:
+        selected_ckpt = _best_checkpoint(output_dir) or latest_ckpt
+        tune_script = PROJECT_ROOT / "src" / "auto_tune_profile.py"
+        command = [
+            sys.executable,
+            str(tune_script),
+            "--model_path",
+            str(selected_ckpt),
+            "--config_path",
+            str(output_config_path),
+            "--text",
+            args.tune_text,
+            "--save_best",
+        ]
+        if args.tune_probe_texts:
+            command += ["--probe_texts", str(args.tune_probe_texts)]
+        if args.tune_ref_dir:
+            command += ["--ref_dir", str(args.tune_ref_dir)]
+        if args.tune_ref_count:
+            command += ["--ref_count", str(args.tune_ref_count)]
+        if args.tune_thorough:
+            command.append("--thorough")
+        if args.tune_target_f0_hz is not None:
+            command += ["--target_f0_hz", str(args.tune_target_f0_hz)]
+        if args.tune_male_voice:
+            command.append("--male_voice")
+        if args.tune_f0_scale_min is not None:
+            command += ["--f0_scale_min", str(args.tune_f0_scale_min)]
+        if args.tune_f0_scale_max is not None:
+            command += ["--f0_scale_max", str(args.tune_f0_scale_max)]
+        ref = args.tune_ref_wav or auto_ref
         if ref:
             command += ["--ref_wav", str(ref)]
         subprocess.run(command, check=True)

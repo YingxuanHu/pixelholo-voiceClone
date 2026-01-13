@@ -1,10 +1,12 @@
 import argparse
 import json
+import random
 import re
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+import torch
 
 from inference import StyleTTS2RepoEngine
 
@@ -44,11 +46,17 @@ def _pick_reference_wav(profile_dir: Path) -> Path | None:
             audio, _ = librosa.effects.trim(audio, top_db=35)
             if len(audio) < sr:
                 continue
+            rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+            if rms < 0.01:
+                continue
             f0 = librosa.yin(audio, fmin=50, fmax=500, sr=sr)
             f0 = f0[np.isfinite(f0)]
-            if f0.size == 0:
+            if f0.size < 5:
                 continue
-            score = float(np.median(f0))
+            f0_median = float(np.median(f0))
+            f0_std = float(np.std(f0))
+            flat = float(np.mean(librosa.feature.spectral_flatness(y=audio)))
+            score = f0_median + (flat * 300.0) + (f0_std / 50.0) - (rms * 20.0)
             if best is None or score < best[0]:
                 best = (score, path)
         except Exception:
@@ -116,6 +124,17 @@ def _split_text(text: str, max_chars: int, max_words: int) -> list[str]:
     return chunks
 
 
+def _apply_pitch_shift(audio: np.ndarray, sample_rate: int, semitones: float) -> np.ndarray:
+    if semitones == 0:
+        return audio
+    try:
+        import librosa
+    except Exception as exc:
+        raise RuntimeError("Missing librosa for pitch shifting.") from exc
+    shifted = librosa.effects.pitch_shift(audio.astype(np.float32), sr=sample_rate, n_steps=semitones)
+    return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="One-step local inference (no server).")
     parser.add_argument("--profile", help="Profile name (uses outputs/training/<profile>).")
@@ -134,13 +153,13 @@ def main() -> None:
     parser.add_argument(
         "--max_chunk_chars",
         type=int,
-        default=220,
+        default=180,
         help="Split long text into chunks of this many characters.",
     )
     parser.add_argument(
         "--max_chunk_words",
         type=int,
-        default=60,
+        default=45,
         help="Split long text into chunks of this many words.",
     )
     parser.add_argument(
@@ -149,6 +168,19 @@ def main() -> None:
         default=180,
         help="Silence between chunks (ms).",
     )
+    parser.add_argument(
+        "--pitch_shift",
+        type=float,
+        default=0.0,
+        help="Pitch shift in semitones (negative for deeper voice).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="Random seed for deterministic generation.",
+    )
+    parser.add_argument("--no_seed", action="store_true", help="Disable deterministic seeding.")
 
     args = parser.parse_args()
 
@@ -229,6 +261,13 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{model_path.stem}_speak.wav"
 
+    if not args.no_seed and args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
     engine = StyleTTS2RepoEngine(model_path=model_path, config_path=config_path)
     chunks = _split_text(args.text, args.max_chunk_chars, args.max_chunk_words)
     if not chunks:
@@ -247,12 +286,15 @@ def main() -> None:
             f0_scale=f0_scale,
             phonemizer_lang=phonemizer_lang,
             lexicon=lexicon,
+            seed=None,
         )
         audio_parts.append(audio.astype(np.float32, copy=False))
         if idx < len(chunks) - 1:
             audio_parts.append(pause)
 
     audio = np.concatenate(audio_parts)
+    if args.pitch_shift:
+        audio = _apply_pitch_shift(audio, engine.sample_rate, args.pitch_shift)
 
     sf.write(out_path, audio, engine.sample_rate)
     print(f"Saved: {out_path}")
