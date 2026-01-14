@@ -98,6 +98,29 @@ def _segment_text_is_valid(
     return text
 
 
+def _transcribe_chunk(
+    model: WhisperModel,
+    chunk_path: Path,
+    language: str,
+    vad_filter: bool,
+    min_avg_logprob: float,
+    max_no_speech_prob: float,
+    min_words: int,
+) -> str | None:
+    segs, _info = model.transcribe(
+        str(chunk_path),
+        language=language,
+        vad_filter=vad_filter,
+    )
+    text_parts = []
+    for segment in segs:
+        text = _segment_text_is_valid(segment, min_avg_logprob, max_no_speech_prob, min_words)
+        if text:
+            text_parts.append(text)
+    text = _sanitize_text(" ".join(text_parts))
+    return text or None
+
+
 def _merge_segments(
     segments: list[dict[str, float | str]],
     merge_gap_sec: float,
@@ -159,14 +182,12 @@ def _transcribe_full_audio(
         duration = float(seg["end"]) - float(seg["start"])
         if duration < min_len_sec:
             continue
-        if duration > max_len_sec:
-            continue
         filtered.append(seg)
 
     if log:
         log(
             f"Segments: raw={len(collected)} merged={len(merged)} kept={len(filtered)} "
-            f"(min_len={min_len_sec}s max_len={max_len_sec}s)"
+            f"(min_len={min_len_sec}s, long segments split at {max_len_sec}s)"
         )
 
     return filtered
@@ -287,15 +308,45 @@ def process_video(
                 if end_ms <= start_ms:
                     continue
                 chunk = audio[start_ms:end_ms]
-                if not _chunk_is_usable(chunk, min_chunk_dbfs, max_clip_dbfs, min_speech_ratio):
-                    continue
-                chunk_name = f"{speaker_name}_{chunk_index:04d}.wav"
-                chunk_path = wavs_dir / chunk_name
-                chunk.export(chunk_path, format="wav")
-                writer.writerow([chunk_name, seg["text"], speaker_name])
-                if chunk_index == 1 or chunk_index % 10 == 0 or chunk_index == len(segments):
-                    _log(f"Wrote {chunk_name} ({chunk_index}/{len(segments)})")
-                chunk_index += 1
+                if len(chunk) > max_len_ms:
+                    for sub_chunk in _split_to_max_len(chunk, max_len_ms):
+                        if len(sub_chunk) < min_len_ms:
+                            continue
+                        if not _chunk_is_usable(sub_chunk, min_chunk_dbfs, max_clip_dbfs, min_speech_ratio):
+                            continue
+                        chunk_name = f"{speaker_name}_{chunk_index:04d}.wav"
+                        chunk_path = wavs_dir / chunk_name
+                        sub_chunk.export(chunk_path, format="wav")
+                        text = _transcribe_chunk(
+                            model=model,
+                            chunk_path=chunk_path,
+                            language=language,
+                            vad_filter=vad_filter,
+                            min_avg_logprob=min_avg_logprob,
+                            max_no_speech_prob=max_no_speech_prob,
+                            min_words=min_words,
+                        )
+                        if not text:
+                            chunk_path.unlink(missing_ok=True)
+                            continue
+                        writer.writerow([chunk_name, text, speaker_name])
+                        if chunk_index == 1 or chunk_index % 10 == 0 or chunk_index == len(segments):
+                            _log(f"Wrote {chunk_name} ({chunk_index}/{len(segments)})")
+                        chunk_index += 1
+                else:
+                    if not _chunk_is_usable(chunk, min_chunk_dbfs, max_clip_dbfs, min_speech_ratio):
+                        continue
+                    chunk_name = f"{speaker_name}_{chunk_index:04d}.wav"
+                    chunk_path = wavs_dir / chunk_name
+                    chunk.export(chunk_path, format="wav")
+                    text = _sanitize_text(str(seg["text"]))
+                    if not text:
+                        chunk_path.unlink(missing_ok=True)
+                        continue
+                    writer.writerow([chunk_name, text, speaker_name])
+                    if chunk_index == 1 or chunk_index % 10 == 0 or chunk_index == len(segments):
+                        _log(f"Wrote {chunk_name} ({chunk_index}/{len(segments)})")
+                    chunk_index += 1
         else:
             _log("Whisper segmentation yielded no usable segments. Falling back to silence split...")
             silence_thresh = (
@@ -329,20 +380,15 @@ def process_video(
                 chunk_name = f"{speaker_name}_{chunk_index:04d}.wav"
                 chunk_path = wavs_dir / chunk_name
                 chunk.export(chunk_path, format="wav")
-
-                segs, _info = model.transcribe(
-                    str(chunk_path),
+                text = _transcribe_chunk(
+                    model=model,
+                    chunk_path=chunk_path,
                     language=language,
                     vad_filter=vad_filter,
+                    min_avg_logprob=min_avg_logprob,
+                    max_no_speech_prob=max_no_speech_prob,
+                    min_words=min_words,
                 )
-                text_parts = []
-                for segment in segs:
-                    text = _segment_text_is_valid(
-                        segment, min_avg_logprob, max_no_speech_prob, min_words
-                    )
-                    if text:
-                        text_parts.append(text)
-                text = _sanitize_text(" ".join(text_parts))
                 if not text:
                     chunk_path.unlink(missing_ok=True)
                     continue

@@ -43,6 +43,9 @@ DEFAULT_DIFFUSION_STEPS = 10
 DEFAULT_EMBEDDING_SCALE = 1.5
 DEFAULT_F0_SCALE = 1.0
 DEFAULT_LANG = "en-ca"
+DEFAULT_MAX_CHUNK_CHARS = 180
+DEFAULT_MAX_CHUNK_WORDS = 45
+DEFAULT_PAUSE_MS = 180
 
 _WORD_RE = re.compile(r"[A-Za-z']+|[^A-Za-z']+")
 _WORD_ONLY_RE = re.compile(r"[A-Za-z']+$")
@@ -50,6 +53,7 @@ _WORD_ONLY_RE = re.compile(r"[A-Za-z']+$")
 app = FastAPI()
 _engine_lock = threading.Lock()
 _engines: dict[tuple[str, str], "StyleTTS2RepoEngine"] = {}
+_SIGMA_WARNED_PATHS: set[str] = set()
 
 
 def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -70,6 +74,27 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
         wf.writeframes(pcm16.tobytes())
 
     return buffer.getvalue()
+
+
+def _split_text(text: str, max_chars: int, max_words: int) -> list[str]:
+    if not text:
+        return []
+    sentences = [s.strip() for s in re.findall(r"[^.!?]+[.!?]?", text) if s.strip()]
+    chunks: list[str] = []
+    for sentence in sentences:
+        if len(sentence) <= max_chars and len(sentence.split()) <= max_words:
+            chunks.append(sentence)
+            continue
+        words = sentence.split()
+        current: list[str] = []
+        for word in words:
+            current.append(word)
+            if len(" ".join(current)) >= max_chars or len(current) >= max_words:
+                chunks.append(" ".join(current))
+                current = []
+        if current:
+            chunks.append(" ".join(current))
+    return chunks
 
 
 def _apply_pitch_shift(
@@ -300,6 +325,9 @@ class GenerateRequest(BaseModel):
     f0_scale: float | None = None
     pitch_shift: float | None = None
     seed: int | None = None
+    max_chunk_chars: int | None = None
+    max_chunk_words: int | None = None
+    pause_ms: int | None = None
     return_base64: bool = False
 
 
@@ -359,9 +387,20 @@ class StyleTTS2RepoEngine:
         if not sigma_ok:
             dist_cfg["sigma_data"] = 0.2
             dist_cfg["estimate_sigma_data"] = False
-            print(
-                f"Config sigma_data invalid ({sigma_data}); forcing to 0.2 for inference."
-            )
+            updated = False
+            try:
+                with self.config_path.open("w") as handle:
+                    yaml.dump(self.config, handle, default_flow_style=False)
+                updated = True
+            except Exception:
+                updated = False
+            key = str(self.config_path.resolve())
+            if key not in _SIGMA_WARNED_PATHS:
+                _SIGMA_WARNED_PATHS.add(key)
+                suffix = " (config updated)" if updated else ""
+                print(
+                    f"Config sigma_data invalid ({sigma_data}); forcing to 0.2 for inference{suffix}."
+                )
 
         preprocess_params = self.config.get("preprocess_params", {})
         self.sample_rate = int(preprocess_params.get("sr", 24000))
@@ -612,18 +651,33 @@ def generate(req: GenerateRequest):
 
     try:
         engine = _get_engine(model_path, config_path)
-        audio = engine.generate(
-            req.text,
-            ref_wav_path=ref_wav_path,
-            alpha=params["alpha"],
-            beta=params["beta"],
-            diffusion_steps=params["diffusion_steps"],
-            embedding_scale=params["embedding_scale"],
-            f0_scale=params["f0_scale"],
-            phonemizer_lang=phonemizer_lang,
-            lexicon=lexicon,
-            seed=req.seed,
-        )
+        max_chars = req.max_chunk_chars or DEFAULT_MAX_CHUNK_CHARS
+        max_words = req.max_chunk_words or DEFAULT_MAX_CHUNK_WORDS
+        pause_ms = req.pause_ms if req.pause_ms is not None else DEFAULT_PAUSE_MS
+        chunks = _split_text(req.text, max_chars, max_words)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Text is empty.")
+        if req.seed is not None:
+            _seed_everything(req.seed)
+        pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+        parts: list[np.ndarray] = []
+        for idx, chunk in enumerate(chunks):
+            audio = engine.generate(
+                chunk,
+                ref_wav_path=ref_wav_path,
+                alpha=params["alpha"],
+                beta=params["beta"],
+                diffusion_steps=params["diffusion_steps"],
+                embedding_scale=params["embedding_scale"],
+                f0_scale=params["f0_scale"],
+                phonemizer_lang=phonemizer_lang,
+                lexicon=lexicon,
+                seed=None,
+            )
+            parts.append(audio.astype(np.float32, copy=False))
+            if idx < len(chunks) - 1:
+                parts.append(pause)
+        audio = np.concatenate(parts)
         if req.pitch_shift is not None and req.pitch_shift != 0:
             audio = _apply_pitch_shift(audio, engine.sample_rate, req.pitch_shift)
     except HTTPException:

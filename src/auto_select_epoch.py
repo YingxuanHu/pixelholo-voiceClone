@@ -184,6 +184,26 @@ def _score(metrics: dict[str, float]) -> float:
     )
 
 
+def _stats_penalty(stats: dict[str, float]) -> float:
+    def _range_penalty(value: float | None, low: float, high: float, weight: float, hard_low: float | None = None) -> float:
+        if value is None or not np.isfinite(value):
+            return 0.0
+        penalty = 0.0
+        if value < low:
+            penalty += (low - value) * weight
+        elif value > high:
+            penalty += (value - high) * weight
+        if hard_low is not None and value < hard_low:
+            penalty += (hard_low - value) * weight * 2.5
+        return penalty
+
+    return (
+        _range_penalty(stats.get("val_loss"), 0.45, 0.55, 2.0, hard_low=0.4)
+        + _range_penalty(stats.get("dur_loss"), 1.4, 1.6, 1.2, hard_low=1.0)
+        + _range_penalty(stats.get("f0_loss"), 1.0, 1.3, 1.2, hard_low=0.8)
+    )
+
+
 def _load_profile_defaults(training_dir: Path) -> dict:
     candidate = training_dir / "profile.json"
     if candidate.exists():
@@ -194,6 +214,44 @@ def _load_profile_defaults(training_dir: Path) -> dict:
         if isinstance(data, dict):
             return data
     return {}
+
+
+def _load_epoch_stats(path: Path) -> dict[int, dict[str, float]]:
+    if not path.exists():
+        return {}
+    text = path.read_text().strip()
+    if not text:
+        return {}
+    entries = []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        entries = parsed
+    elif isinstance(parsed, dict):
+        entries = [parsed]
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    stats = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        epoch = entry.get("epoch")
+        if epoch is None:
+            continue
+        try:
+            stats[int(epoch)] = entry
+        except (ValueError, TypeError):
+            continue
+    return stats
 
 
 def _load_f0_scale(training_dir: Path, override: float | None) -> float:
@@ -396,6 +454,7 @@ def main() -> None:
     if not ref_wavs:
         raise FileNotFoundError("No reference wavs found. Provide --ref_wav or --ref_dir.")
 
+    epoch_stats = _load_epoch_stats(training_dir / "epoch_stats.json")
     results = []
     store_audio = args.save_best or args.use_resemblyzer
     best_audio_by_ckpt = {} if store_audio else None
@@ -456,13 +515,18 @@ def main() -> None:
         summary = {}
         for key, values in all_metrics.items():
             summary[key] = float(np.mean(values)) if values else 0.0
-        score = _score(summary) + (failures * 0.5)
+        epoch_index = _epoch_index(str(ckpt))
+        stats = epoch_stats.get(epoch_index) if epoch_index is not None else None
+        stats_penalty = _stats_penalty(stats) if stats else 0.0
+        score = _score(summary) + (failures * 0.5) + stats_penalty
         entry = {
             "checkpoint": str(ckpt),
             "score": score,
             "metrics": summary,
             "failures": failures,
-            "epoch_index": _epoch_index(str(ckpt)),
+            "epoch_index": epoch_index,
+            "stats": stats or {},
+            "stats_penalty": stats_penalty,
         }
         results.append(entry)
         if best_audio_by_ckpt is not None and best_sample is not None:
@@ -546,12 +610,29 @@ def main() -> None:
         for entry in results_sorted[:top_n]:
             epoch_label = entry.get("epoch_index")
             epoch_display = f"{epoch_label:04d}" if isinstance(epoch_label, int) else "unknown"
+            stats = entry.get("stats") or {}
+            stats_str = ""
+            if stats:
+                val = stats.get("val_loss")
+                dur = stats.get("dur_loss")
+                f0 = stats.get("f0_loss")
+                if (
+                    isinstance(val, (int, float))
+                    and isinstance(dur, (int, float))
+                    and isinstance(f0, (int, float))
+                    and np.isfinite(val)
+                    and np.isfinite(dur)
+                    and np.isfinite(f0)
+                ):
+                    stats_str = f"  val={val:.3f} dur={dur:.3f} f0={f0:.3f}"
             spk_sim = entry.get("spk_sim")
             if spk_sim is None:
-                print(f"  epoch {epoch_display}  score {entry['score']:.5f}  {entry['checkpoint']}")
+                print(
+                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}  {entry['checkpoint']}"
+                )
             else:
                 print(
-                    f"  epoch {epoch_display}  score {entry['score']:.5f}  spk {spk_sim:.4f}  "
+                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}  spk {spk_sim:.4f}  "
                     f"{entry['checkpoint']}"
                 )
     print(f"Wrote {best_path}")

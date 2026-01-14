@@ -24,6 +24,7 @@ warnings.filterwarnings(
 from config import (  # noqa: E402
     DEFAULT_BATCH_SIZE,
     DEFAULT_EPOCHS,
+    DEFAULT_F_MAX,
     DEFAULT_FP16,
     DEFAULT_MAX_LEN,
     DEFAULT_MIN_SPEECH_RATIO,
@@ -201,7 +202,13 @@ def _patch_config(
 
     preprocess_params = config.get("preprocess_params", {})
     if "sr" not in preprocess_params:
-        preprocess_params["sr"] = 44100
+        preprocess_params["sr"] = DEFAULT_SAMPLE_RATE
+    spect_params = preprocess_params.get("spect_params", {})
+    if not isinstance(spect_params, dict):
+        spect_params = {}
+    if spect_params.get("f_max") in (None, 0, "null"):
+        spect_params["f_max"] = DEFAULT_F_MAX
+    preprocess_params["spect_params"] = spect_params
     config["preprocess_params"] = preprocess_params
 
     if pretrained_model:
@@ -210,6 +217,27 @@ def _patch_config(
         config["max_steps"] = max_steps
     if grad_accum_steps is not None:
         config["grad_accum_steps"] = grad_accum_steps
+
+    early_stop = config.get("early_stop", {})
+    if not isinstance(early_stop, dict):
+        early_stop = {}
+    early_stop.setdefault("enabled", True)
+    early_stop.setdefault("patience", 2)
+    sweet = early_stop.get("sweet_spot", {})
+    if not isinstance(sweet, dict):
+        sweet = {}
+    sweet.setdefault("val", {"min": 0.45, "max": 0.55})
+    sweet.setdefault("dur", {"min": 1.4, "max": 1.6})
+    sweet.setdefault("f0", {"min": 1.0, "max": 1.3})
+    early_stop["sweet_spot"] = sweet
+    overfit = early_stop.get("overfit", {})
+    if not isinstance(overfit, dict):
+        overfit = {}
+    overfit.setdefault("val", 0.4)
+    overfit.setdefault("dur", 1.0)
+    overfit.setdefault("f0", 0.8)
+    early_stop["overfit"] = overfit
+    config["early_stop"] = early_stop
 
     return config
 

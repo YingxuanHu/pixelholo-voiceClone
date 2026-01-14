@@ -95,12 +95,14 @@ python src/speak.py --profile name1 --text "Hello, this is a test."
 - `--merge_gap_sec`: merge adjacent segments within this gap.
 - `--legacy_split`: use silence splitting before transcription.
 - `--quiet`: reduce logs.
+- Long segments are split and re-transcribed into smaller clips.
 
 ### Train (`src/train.py`)
 - `--dataset_path`: profile dataset (e.g., `./data/name1`).
 - `--output_dir`: override checkpoint output folder.
 - `--epochs`, `--batch_size`, `--max_len`, `--grad_accum_steps`: training knobs.
 - `--max_text_chars`, `--max_text_words`: drop overly long transcripts to avoid BERT limits.
+- Early stop: training writes `epoch_stats.json` (val/dur/f0) and stops early when it hits the sweet-spot range or overfits. Adjust thresholds in `outputs/training/<profile>/config_ft.yml` under `early_stop`.
 - `--auto_tune_profile`: writes `profile.json` (auto alpha/beta/steps/scale/f0).
 - `--auto_select_epoch`: writes `best_epoch.txt` + `epoch_scores.json` (evaluates all epochs unless `--select_limit` is set).
 - `--auto_build_lexicon`: writes `data/<name>/lexicon.json`.
@@ -129,9 +131,11 @@ python src/speak.py --profile name1 --text "Hello, this is a test."
 - `--pause_ms`: silence inserted between chunks.
 - `--pitch_shift`: semitone shift post-process (negative = deeper voice).
 - `--seed`: deterministic generation (default 1234); use `--no_seed` to disable.
+API requests can also pass `max_chunk_chars`, `max_chunk_words`, and `pause_ms` to control chunking.
 
 ## Notes
 - `src/train.py` patches a StyleTTS2 config and launches the finetune script.
+- Training now defaults `spect_params.f_max` to 8000 Hz when missing, to reduce high-frequency sharpness.
 - `src/inference.py` caches the model in memory for low latency.
 - `src/auto_tune_profile.py` writes `profile.json` next to a checkpoint with tuned defaults.
 - Auto-tuning adapts alpha/beta if pitch correlation is low or timbre similarity is too high.
@@ -139,6 +143,7 @@ python src/speak.py --profile name1 --text "Hello, this is a test."
 - If `profile.json` or `f0_scale.txt` exist next to a model, inference will use them automatically.
 - `src/auto_select_epoch.py` scores checkpoints and writes `best_epoch.txt`.
 - Selection prefers earlier epochs within a score margin (disable with `--no_prefer_earlier`).
+- If `epoch_stats.json` exists, selection also penalizes epochs outside the sweet-spot loss ranges.
 - Optional: add `--use_resemblyzer` to rank top-quality epochs by speaker similarity (requires `pip install resemblyzer`).
 - Epoch scoring now also penalizes noisy outputs (flatness/ZCR) and low harmonicity.
 - `src/auto_tune_profile.py` now also writes `f0_scale.txt` for downstream tools.
