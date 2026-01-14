@@ -379,11 +379,6 @@ def main() -> None:
         help="Target median F0 in Hz (e.g., 100 for a deeper male voice).",
     )
     parser.add_argument(
-        "--male_voice",
-        action="store_true",
-        help="Convenience flag to target a deeper male F0 (~100 Hz).",
-    )
-    parser.add_argument(
         "--f0_scale_min",
         type=float,
         default=0.6,
@@ -497,8 +492,6 @@ def main() -> None:
     f0_scale = float(np.median(f0_scales)) if f0_scales else 1.0
     ref_f0_median = float(np.median(ref_f0s)) if ref_f0s else None
     target_f0 = args.target_f0_hz
-    if target_f0 is None and args.male_voice:
-        target_f0 = 100.0
     if target_f0 and ref_f0_median:
         target_scale = target_f0 / ref_f0_median
         f0_scale *= target_scale

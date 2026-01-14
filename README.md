@@ -117,7 +117,6 @@ python src/speak.py --profile name1 --text "Hello, this is a test."
 - `--quality_top_n`: number of top-quality epochs to compare (default 5).
 - `--identity_margin`: prefer earlier epoch within this similarity margin.
 - `--tune_target_f0_hz`: target median F0 for deeper/shallower voices.
-- `--tune_male_voice`: convenience flag to target ~100 Hz F0.
 - If no reference wav is provided, the script auto-picks one from `processed_wavs`.
 - If both auto-select and auto-tune are enabled, auto-tune uses the chosen best epoch.
 

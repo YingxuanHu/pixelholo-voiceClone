@@ -315,7 +315,6 @@ def main() -> None:
     parser.add_argument("--tune_probe_texts", type=Path, help="Text file with prompts for tuning")
     parser.add_argument("--tune_thorough", action="store_true", help="Use multiple refs/texts for tuning")
     parser.add_argument("--tune_target_f0_hz", type=float, help="Target median F0 for tuning.")
-    parser.add_argument("--tune_male_voice", action="store_true", help="Target deeper male F0 for tuning.")
     parser.add_argument("--tune_f0_scale_min", type=float, help="Minimum f0_scale clamp for tuning.")
     parser.add_argument("--tune_f0_scale_max", type=float, help="Maximum f0_scale clamp for tuning.")
     parser.add_argument(
@@ -483,8 +482,6 @@ def main() -> None:
             command.append("--thorough")
         if args.tune_target_f0_hz is not None:
             command += ["--target_f0_hz", str(args.tune_target_f0_hz)]
-        if args.tune_male_voice:
-            command.append("--male_voice")
         if args.tune_f0_scale_min is not None:
             command += ["--f0_scale_min", str(args.tune_f0_scale_min)]
         if args.tune_f0_scale_max is not None:
