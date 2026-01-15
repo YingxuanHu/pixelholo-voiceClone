@@ -232,7 +232,7 @@ def main() -> None:
     diffusion_steps = (
         args.diffusion_steps
         if args.diffusion_steps is not None
-        else defaults.get("diffusion_steps", 10)
+        else defaults.get("diffusion_steps", 30)
     )
     embedding_scale = (
         args.embedding_scale
