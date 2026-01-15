@@ -2,6 +2,7 @@ import argparse
 import random
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -184,6 +185,13 @@ def _patch_config(
     pretrained_model: str | None,
     max_steps: int | None,
     grad_accum_steps: int | None,
+    early_stop_enabled: bool,
+    early_stop_min_epoch: int,
+    early_stop_patience: int,
+    early_stop_overfit_val: float,
+    early_stop_overfit_dur: float,
+    early_stop_overfit_f0: float,
+    early_stop_overfit_patience: int,
 ) -> dict:
     config["log_dir"] = str(output_dir)
     config["batch_size"] = batch_size
@@ -221,8 +229,10 @@ def _patch_config(
     early_stop = config.get("early_stop", {})
     if not isinstance(early_stop, dict):
         early_stop = {}
-    early_stop.setdefault("enabled", True)
-    early_stop.setdefault("patience", 2)
+    early_stop["enabled"] = bool(early_stop_enabled)
+    early_stop["min_epoch"] = int(early_stop_min_epoch)
+    early_stop["patience"] = int(early_stop_patience)
+    early_stop["overfit_patience"] = int(early_stop_overfit_patience)
     sweet = early_stop.get("sweet_spot", {})
     if not isinstance(sweet, dict):
         sweet = {}
@@ -233,9 +243,9 @@ def _patch_config(
     overfit = early_stop.get("overfit", {})
     if not isinstance(overfit, dict):
         overfit = {}
-    overfit.setdefault("val", 0.4)
-    overfit.setdefault("dur", 1.0)
-    overfit.setdefault("f0", 0.8)
+    overfit["val"] = float(early_stop_overfit_val)
+    overfit["dur"] = float(early_stop_overfit_dur)
+    overfit["f0"] = float(early_stop_overfit_f0)
     early_stop["overfit"] = overfit
     config["early_stop"] = early_stop
 
@@ -298,6 +308,54 @@ def main() -> None:
         help="Drop samples with text longer than this many words.",
     )
     parser.add_argument("--dry_run", action="store_true", help="Only write config, do not start training")
+    parser.add_argument(
+        "--early_stop",
+        action="store_true",
+        help="Enable early-stop during training (default).",
+    )
+    parser.add_argument(
+        "--no_early_stop",
+        action="store_false",
+        dest="early_stop",
+        help="Disable early-stop during training.",
+    )
+    parser.add_argument(
+        "--early_stop_min_epoch",
+        type=int,
+        default=8,
+        help="Do not early-stop before this epoch.",
+    )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=3,
+        help="Number of sweet-spot epochs before stopping.",
+    )
+    parser.add_argument(
+        "--early_stop_overfit_patience",
+        type=int,
+        default=2,
+        help="Consecutive overfit hits before stopping.",
+    )
+    parser.add_argument(
+        "--early_stop_overfit_val",
+        type=float,
+        default=0.35,
+        help="Early-stop if val_loss falls below this (overfit).",
+    )
+    parser.add_argument(
+        "--early_stop_overfit_dur",
+        type=float,
+        default=1.0,
+        help="Early-stop if dur_loss falls below this (overfit).",
+    )
+    parser.add_argument(
+        "--early_stop_overfit_f0",
+        type=float,
+        default=0.8,
+        help="Early-stop if f0_loss falls below this (overfit).",
+    )
+    parser.set_defaults(early_stop=True)
     parser.add_argument(
         "--auto_tune_profile",
         action="store_true",
@@ -369,6 +427,7 @@ def main() -> None:
     parser.add_argument("--lexicon_min_count", type=int, default=1, help="Minimum word count for lexicon")
 
     args = parser.parse_args()
+    pipeline_start = time.perf_counter()
 
     if args.tune_quick:
         args.tune_thorough = False
@@ -418,6 +477,13 @@ def main() -> None:
         pretrained_model=args.pretrained_checkpoint,
         max_steps=args.max_steps,
         grad_accum_steps=args.grad_accum_steps,
+        early_stop_enabled=args.early_stop,
+        early_stop_min_epoch=args.early_stop_min_epoch,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_overfit_val=args.early_stop_overfit_val,
+        early_stop_overfit_dur=args.early_stop_overfit_dur,
+        early_stop_overfit_f0=args.early_stop_overfit_f0,
+        early_stop_overfit_patience=args.early_stop_overfit_patience,
     )
 
     output_config_path = output_dir / "config_ft.yml"
@@ -430,11 +496,14 @@ def main() -> None:
     if args.dry_run:
         return
 
+    train_start = time.perf_counter()
     launch_training(
         styletts2_dir=args.styletts2_dir,
         config_path=output_config_path,
         use_accelerate=args.use_accelerate,
     )
+    train_elapsed = time.perf_counter() - train_start
+    print(f"Training time: {train_elapsed:.2f}s")
 
     latest_ckpt = _latest_checkpoint(output_dir)
     if latest_ckpt is None:
@@ -536,6 +605,9 @@ def main() -> None:
             str(args.lexicon_min_count),
         ]
         subprocess.run(command, check=True)
+
+    total_elapsed = time.perf_counter() - pipeline_start
+    print(f"Total pipeline time: {total_elapsed:.2f}s")
 
 
 if __name__ == "__main__":

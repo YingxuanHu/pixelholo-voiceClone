@@ -220,10 +220,24 @@ def _evaluate_grid(
 ) -> tuple[dict, np.ndarray | None]:
     best = None
     best_audio = None
+    total = len(alphas) * len(betas) * len(diffusions) * len(embeddings)
+    idx = 0
     for alpha in alphas:
         for beta in betas:
             for diffusion_steps in diffusions:
                 for embedding_scale in embeddings:
+                    idx += 1
+                    print(
+                        "Scoring {}/{}: alpha={} beta={} diffusion={} embedding={} f0_scale={:.3f}".format(
+                            idx,
+                            total,
+                            alpha,
+                            beta,
+                            diffusion_steps,
+                            embedding_scale,
+                            f0_scale,
+                        )
+                    )
                     all_metrics: dict[str, list[float]] = {
                         "pitch_ratio": [],
                         "mfcc_cos": [],
@@ -271,6 +285,15 @@ def _evaluate_grid(
                     for key, values in all_metrics.items():
                         summary[key] = float(np.mean(values)) if values else 0.0
                     score = _score(summary) + (failures * 0.5)
+                    print(
+                        " -> score={:.4f} failures={} pitch_ratio={:.3f} mfcc_cos={:.3f} f0_corr={:.3f}".format(
+                            score,
+                            failures,
+                            summary.get("pitch_ratio", 0.0),
+                            summary.get("mfcc_cos", 0.0),
+                            summary.get("f0_corr", 0.0),
+                        )
+                    )
                     record = {
                         "alpha": alpha,
                         "beta": beta,
@@ -343,12 +366,29 @@ def main() -> None:
         help="Text prompt for the probe generation.",
     )
     parser.add_argument("--probe_texts", type=Path, help="Text file with one prompt per line.")
-    parser.add_argument("--thorough", action="store_true", help="Use multiple refs + probe texts.")
+    parser.add_argument(
+        "--thorough",
+        action="store_true",
+        default=True,
+        help="Use multiple refs + probe texts (default).",
+    )
+    parser.add_argument("--quick", action="store_false", dest="thorough", help="Use a single ref + prompt.")
     parser.add_argument("--alphas", help="Comma-separated alpha values.")
     parser.add_argument("--betas", help="Comma-separated beta values.")
     parser.add_argument("--diffusions", help="Comma-separated diffusion steps.")
     parser.add_argument("--embeddings", help="Comma-separated embedding scales.")
-    parser.add_argument("--save_best", action="store_true", help="Save best sample wav.")
+    parser.add_argument(
+        "--save_best",
+        action="store_true",
+        default=True,
+        help="Save best sample wav (default).",
+    )
+    parser.add_argument(
+        "--no_save_best",
+        action="store_false",
+        dest="save_best",
+        help="Disable saving best sample wav.",
+    )
     parser.add_argument(
         "--adaptive",
         action="store_true",
@@ -401,14 +441,20 @@ def main() -> None:
     parser.add_argument("--max_chunk_chars", type=int, default=180, help="Default max chunk chars.")
     parser.add_argument("--max_chunk_words", type=int, default=45, help="Default max chunk words.")
     parser.add_argument("--pause_ms", type=int, default=180, help="Default pause between chunks (ms).")
-    parser.add_argument("--pitch_shift", type=float, default=0.0, help="Default pitch shift in semitones.")
+    parser.add_argument(
+        "--crossfade_ms",
+        type=float,
+        default=8.0,
+        help="Default crossfade between chunks (ms).",
+    )
+    parser.add_argument("--pitch_shift", type=float, default=-0.5, help="Default pitch shift in semitones.")
     parser.add_argument(
         "--de_esser_cutoff",
         type=float,
-        default=0.0,
+        default=8500.0,
         help="Default de-esser cutoff Hz (0 disables).",
     )
-    parser.add_argument("--de_esser_order", type=int, default=2, help="Default de-esser filter order.")
+    parser.add_argument("--de_esser_order", type=int, default=1, help="Default de-esser filter order.")
 
     args = parser.parse_args()
 
@@ -470,14 +516,24 @@ def main() -> None:
     if not ref_wavs:
         raise FileNotFoundError("Reference wav not found. Provide --ref_wav or --ref_dir.")
 
-    alphas = _parse_list(args.alphas, [0.1, 0.3])
-    betas = _parse_list(args.betas, [0.1, 0.3])
-    diffusions = _parse_int_list(args.diffusions, [10, 25])
-    embeddings = _parse_list(args.embeddings, [1.0, 1.3])
+    alphas = _parse_list(args.alphas, [0.6])
+    betas = _parse_list(args.betas, [0.7])
+    diffusions = _parse_int_list(args.diffusions, [20])
+    embeddings = _parse_list(args.embeddings, [1.2])
 
     print(f"Using model: {model_path}")
     print(f"Using config: {config_path}")
     print(f"Using {len(ref_wavs)} reference wav(s) and {len(texts)} prompt(s).")
+    grid_total = len(alphas) * len(betas) * len(diffusions) * len(embeddings)
+    sample_total = len(ref_wavs) * len(texts)
+    print(
+        "Grid size: {} combos | Per combo samples: {} refs x {} prompts = {}".format(
+            grid_total,
+            len(ref_wavs),
+            len(texts),
+            sample_total,
+        )
+    )
 
     engine = StyleTTS2RepoEngine(model_path=model_path, config_path=config_path)
     sr = engine.sample_rate
@@ -584,6 +640,7 @@ def main() -> None:
         "max_chunk_chars": args.max_chunk_chars,
         "max_chunk_words": args.max_chunk_words,
         "pause_ms": args.pause_ms,
+        "crossfade_ms": args.crossfade_ms,
         "pitch_shift": args.pitch_shift,
         "de_esser_cutoff": args.de_esser_cutoff,
         "de_esser_order": args.de_esser_order,

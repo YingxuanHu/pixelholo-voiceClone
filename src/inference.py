@@ -6,8 +6,12 @@ import io
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
 import threading
+import tempfile
+import time
 import warnings
 from pathlib import Path
 
@@ -104,6 +108,34 @@ def _apply_pitch_shift(
 ) -> np.ndarray:
     if semitones == 0:
         return audio
+    if shutil.which("rubberband"):
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                in_path = Path(tmpdir) / "in.wav"
+                out_path = Path(tmpdir) / "out.wav"
+                import soundfile as sf
+
+                sf.write(in_path, audio, sample_rate)
+                result = subprocess.run(
+                    ["rubberband", "-p", str(semitones), str(in_path), str(out_path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "rubberband failed")
+                shifted, out_sr = sf.read(out_path)
+                if shifted.ndim > 1:
+                    shifted = shifted.mean(axis=1)
+                if out_sr != sample_rate:
+                    try:
+                        import librosa
+                    except Exception as exc:
+                        raise RuntimeError("Missing librosa for pitch resampling.") from exc
+                    shifted = librosa.resample(shifted, orig_sr=out_sr, target_sr=sample_rate)
+                return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
+        except Exception:
+            pass
     try:
         import librosa
     except Exception as exc:
@@ -130,6 +162,39 @@ def _apply_de_esser(
     sos = butter(order, cutoff_hz, btype="lowpass", fs=sample_rate, output="sos")
     filtered = sosfilt(sos, audio.astype(np.float32))
     return np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _soft_clip(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
+    if audio.size == 0:
+        return audio
+    audio = audio.astype(np.float32, copy=False)
+    max_val = float(np.max(np.abs(audio)))
+    if max_val <= threshold:
+        return audio
+    return np.tanh(audio / threshold) * threshold
+
+
+def _apply_crossfade(chunks: list[np.ndarray], sample_rate: int, crossfade_ms: float) -> np.ndarray:
+    if not chunks:
+        return np.array([], dtype=np.float32)
+    if crossfade_ms <= 0:
+        return np.concatenate(chunks)
+    cross_len = int(sample_rate * (crossfade_ms / 1000.0))
+    if cross_len < 2:
+        return np.concatenate(chunks)
+    faded = chunks[0].astype(np.float32, copy=False)
+    fade_out = np.linspace(1.0, 0.0, cross_len, dtype=np.float32)
+    fade_in = np.linspace(0.0, 1.0, cross_len, dtype=np.float32)
+    for nxt in chunks[1:]:
+        nxt = nxt.astype(np.float32, copy=False)
+        if faded.size < cross_len or nxt.size < cross_len:
+            faded = np.concatenate([faded, nxt])
+            continue
+        tail = faded[-cross_len:] * fade_out
+        head = nxt[:cross_len] * fade_in
+        blended = tail + head
+        faded = np.concatenate([faded[:-cross_len], blended, nxt[cross_len:]])
+    return faded
 
 
 def _seed_everything(seed: int) -> None:
@@ -350,6 +415,7 @@ class GenerateRequest(BaseModel):
     max_chunk_chars: int | None = None
     max_chunk_words: int | None = None
     pause_ms: int | None = None
+    crossfade_ms: float | None = None
     return_base64: bool = False
 
 
@@ -656,6 +722,7 @@ def _startup() -> None:
 
 @app.post("/generate")
 def generate(req: GenerateRequest):
+    start_time = time.perf_counter()
     model_path_value = req.model_path or os.getenv("STYLE_TTS2_MODEL")
     if not model_path_value:
         raise HTTPException(status_code=400, detail="model_path is required")
@@ -689,13 +756,18 @@ def generate(req: GenerateRequest):
             if req.pause_ms is not None
             else profile.get("pause_ms", DEFAULT_PAUSE_MS)
         )
+        crossfade_ms = (
+            req.crossfade_ms
+            if req.crossfade_ms is not None
+            else profile.get("crossfade_ms", 8.0)
+        )
         chunks = _split_text(req.text, max_chars, max_words)
         if not chunks:
             raise HTTPException(status_code=400, detail="Text is empty.")
         if req.seed is not None:
             _seed_everything(req.seed)
-        pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
         parts: list[np.ndarray] = []
+        pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
         for idx, chunk in enumerate(chunks):
             audio = engine.generate(
                 chunk,
@@ -712,7 +784,7 @@ def generate(req: GenerateRequest):
             parts.append(audio.astype(np.float32, copy=False))
             if idx < len(chunks) - 1:
                 parts.append(pause)
-        audio = np.concatenate(parts)
+        audio = _apply_crossfade(parts, engine.sample_rate, crossfade_ms)
         pitch_shift = (
             req.pitch_shift
             if req.pitch_shift is not None
@@ -732,6 +804,7 @@ def generate(req: GenerateRequest):
         )
         if de_esser_cutoff:
             audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
+        audio = _soft_clip(audio)
     except HTTPException:
         raise
     except Exception as exc:
@@ -741,6 +814,15 @@ def generate(req: GenerateRequest):
 
     if req.return_base64:
         payload = base64.b64encode(wav_bytes).decode("ascii")
-        return JSONResponse({"audio_base64": payload})
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        return JSONResponse(
+            {"audio_base64": payload, "inference_ms": round(elapsed_ms, 2)},
+            headers={"X-Inference-Time-Ms": f"{elapsed_ms:.2f}"},
+        )
 
-    return Response(content=wav_bytes, media_type="audio/wav")
+    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"X-Inference-Time-Ms": f"{elapsed_ms:.2f}"},
+    )

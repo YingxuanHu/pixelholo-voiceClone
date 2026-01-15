@@ -2,6 +2,10 @@ import argparse
 import json
 import random
 import re
+import shutil
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -127,6 +131,32 @@ def _split_text(text: str, max_chars: int, max_words: int) -> list[str]:
 def _apply_pitch_shift(audio: np.ndarray, sample_rate: int, semitones: float) -> np.ndarray:
     if semitones == 0:
         return audio
+    if shutil.which("rubberband"):
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                in_path = Path(tmpdir) / "in.wav"
+                out_path = Path(tmpdir) / "out.wav"
+                sf.write(in_path, audio, sample_rate)
+                result = subprocess.run(
+                    ["rubberband", "-p", str(semitones), str(in_path), str(out_path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "rubberband failed")
+                shifted, out_sr = sf.read(out_path)
+                if shifted.ndim > 1:
+                    shifted = shifted.mean(axis=1)
+                if out_sr != sample_rate:
+                    try:
+                        import librosa
+                    except Exception as exc:
+                        raise RuntimeError("Missing librosa for pitch resampling.") from exc
+                    shifted = librosa.resample(shifted, orig_sr=out_sr, target_sr=sample_rate)
+                return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
+        except Exception:
+            pass
     try:
         import librosa
     except Exception as exc:
@@ -148,6 +178,39 @@ def _apply_de_esser(audio: np.ndarray, sample_rate: int, cutoff_hz: float, order
     sos = butter(order, cutoff_hz, btype="lowpass", fs=sample_rate, output="sos")
     filtered = sosfilt(sos, audio.astype(np.float32))
     return np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _soft_clip(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
+    if audio.size == 0:
+        return audio
+    audio = audio.astype(np.float32, copy=False)
+    max_val = float(np.max(np.abs(audio)))
+    if max_val <= threshold:
+        return audio
+    return np.tanh(audio / threshold) * threshold
+
+
+def _apply_crossfade(chunks: list[np.ndarray], sample_rate: int, crossfade_ms: float) -> np.ndarray:
+    if not chunks:
+        return np.array([], dtype=np.float32)
+    if crossfade_ms <= 0:
+        return np.concatenate(chunks)
+    cross_len = int(sample_rate * (crossfade_ms / 1000.0))
+    if cross_len < 2:
+        return np.concatenate(chunks)
+    faded = chunks[0].astype(np.float32, copy=False)
+    fade_out = np.linspace(1.0, 0.0, cross_len, dtype=np.float32)
+    fade_in = np.linspace(0.0, 1.0, cross_len, dtype=np.float32)
+    for nxt in chunks[1:]:
+        nxt = nxt.astype(np.float32, copy=False)
+        if faded.size < cross_len or nxt.size < cross_len:
+            faded = np.concatenate([faded, nxt])
+            continue
+        tail = faded[-cross_len:] * fade_out
+        head = nxt[:cross_len] * fade_in
+        blended = tail + head
+        faded = np.concatenate([faded[:-cross_len], blended, nxt[cross_len:]])
+    return faded
 
 
 def main() -> None:
@@ -182,6 +245,12 @@ def main() -> None:
         type=int,
         default=None,
         help="Silence between chunks (ms).",
+    )
+    parser.add_argument(
+        "--crossfade_ms",
+        type=float,
+        default=8.0,
+        help="Crossfade between chunks to avoid clicks (ms).",
     )
     parser.add_argument(
         "--pitch_shift",
@@ -308,6 +377,9 @@ def main() -> None:
     pause_ms = args.pause_ms
     if pause_ms is None:
         pause_ms = defaults.get("pause_ms", 180)
+    crossfade_ms = args.crossfade_ms
+    if crossfade_ms is None:
+        crossfade_ms = defaults.get("crossfade_ms", 8.0)
     pitch_shift = args.pitch_shift
     if pitch_shift is None:
         pitch_shift = defaults.get("pitch_shift", 0.0)
@@ -332,6 +404,7 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
 
+    infer_start = time.perf_counter()
     engine = StyleTTS2RepoEngine(model_path=model_path, config_path=config_path)
     chunks = _split_text(args.text, max_chunk_chars, max_chunk_words)
     if not chunks:
@@ -339,6 +412,7 @@ def main() -> None:
 
     audio_parts: list[np.ndarray] = []
     pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+    chunk_seed = None if args.no_seed else args.seed
     for idx, chunk in enumerate(chunks):
         audio = engine.generate(
             chunk,
@@ -350,20 +424,23 @@ def main() -> None:
             f0_scale=f0_scale,
             phonemizer_lang=phonemizer_lang,
             lexicon=lexicon,
-            seed=None,
+            seed=chunk_seed,
         )
         audio_parts.append(audio.astype(np.float32, copy=False))
         if idx < len(chunks) - 1:
             audio_parts.append(pause)
 
-    audio = np.concatenate(audio_parts)
+    audio = _apply_crossfade(audio_parts, engine.sample_rate, crossfade_ms)
     if pitch_shift:
         audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
     if de_esser_cutoff:
         audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
+    audio = _soft_clip(audio)
 
     sf.write(out_path, audio, engine.sample_rate)
+    infer_elapsed = time.perf_counter() - infer_start
     print(f"Saved: {out_path}")
+    print(f"Inference time: {infer_elapsed:.2f}s")
 
 
 if __name__ == "__main__":

@@ -269,6 +269,58 @@ def _stats_penalty(stats: dict[str, float]) -> float:
     )
 
 
+def _normalized_stats_scores(
+    epoch_stats: dict[int, dict[str, float]],
+    weights: dict[str, float],
+) -> dict[int, float]:
+    vals = []
+    durs = []
+    f0s = []
+    for stats in epoch_stats.values():
+        val = stats.get("val_loss")
+        dur = stats.get("dur_loss")
+        f0 = stats.get("f0_loss")
+        if isinstance(val, (int, float)) and np.isfinite(val):
+            vals.append(float(val))
+        if isinstance(dur, (int, float)) and np.isfinite(dur):
+            durs.append(float(dur))
+        if isinstance(f0, (int, float)) and np.isfinite(f0):
+            f0s.append(float(f0))
+    if not vals or not durs or not f0s:
+        return {}
+
+    min_val, max_val = min(vals), max(vals)
+    min_dur, max_dur = min(durs), max(durs)
+    min_f0, max_f0 = min(f0s), max(f0s)
+
+    def _norm(value: float, low: float, high: float) -> float:
+        if high - low < 1e-6:
+            return 0.0
+        return (value - low) / (high - low)
+
+    scores: dict[int, float] = {}
+    for epoch, stats in epoch_stats.items():
+        val = stats.get("val_loss")
+        dur = stats.get("dur_loss")
+        f0 = stats.get("f0_loss")
+        if not (
+            isinstance(val, (int, float))
+            and isinstance(dur, (int, float))
+            and isinstance(f0, (int, float))
+            and np.isfinite(val)
+            and np.isfinite(dur)
+            and np.isfinite(f0)
+        ):
+            continue
+        score = (
+            _norm(float(val), min_val, max_val) * weights["val"]
+            + _norm(float(dur), min_dur, max_dur) * weights["dur"]
+            + _norm(float(f0), min_f0, max_f0) * weights["f0"]
+        )
+        scores[epoch] = float(score)
+    return scores
+
+
 def _load_profile_defaults(training_dir: Path) -> dict:
     candidate = training_dir / "profile.json"
     if candidate.exists():
@@ -466,6 +518,12 @@ def main() -> None:
         help="Ignore epoch_stats entries below this epoch.",
     )
     parser.add_argument(
+        "--stats_weight",
+        type=float,
+        default=1.0,
+        help="Weight for normalized val/dur/f0 stats score.",
+    )
+    parser.add_argument(
         "--overfit_floor_factor",
         type=float,
         default=0.8,
@@ -574,6 +632,8 @@ def main() -> None:
                         f"(kept {len(filtered)} of {len(checkpoints)})"
                     )
                     checkpoints = filtered
+    stats_weights = {"val": 0.2, "dur": 0.5, "f0": 0.3}
+    stats_scores = _normalized_stats_scores(epoch_stats, stats_weights) if epoch_stats else {}
     results = []
     store_audio = args.save_best or args.use_resemblyzer
     best_audio_by_ckpt = {} if store_audio else None
@@ -658,8 +718,11 @@ def main() -> None:
         epoch_index = _epoch_index(str(ckpt))
         stats = epoch_stats.get(epoch_index) if epoch_index is not None else None
         stats_penalty = _stats_penalty(stats) if stats else 0.0
+        stats_score = stats_scores.get(epoch_index) if epoch_index is not None else None
         base_score = float(np.median(sample_scores)) if sample_scores else _score(summary)
         score = base_score + (failures * 0.5) + stats_penalty
+        if stats_score is not None:
+            score += stats_score * args.stats_weight
         entry = {
             "checkpoint": str(ckpt),
             "score": score,
@@ -668,6 +731,7 @@ def main() -> None:
             "epoch_index": epoch_index,
             "stats": stats or {},
             "stats_penalty": stats_penalty,
+            "stats_score": stats_score,
         }
         results.append(entry)
         if best_audio_by_ckpt is not None and best_sample is not None:
@@ -766,17 +830,22 @@ def main() -> None:
                     and np.isfinite(f0)
                 ):
                     stats_str = f"  val={val:.3f} dur={dur:.3f} f0={f0:.3f}"
+            stats_score = entry.get("stats_score")
+            stats_score_str = ""
+            if isinstance(stats_score, (int, float)) and np.isfinite(stats_score):
+                stats_score_str = f"  stats_score={stats_score:.3f}"
             wer = entry.get("metrics", {}).get("wer")
             wer_str = f"  wer={wer:.3f}" if isinstance(wer, (int, float)) and np.isfinite(wer) else ""
             spk_sim = entry.get("spk_sim")
             if spk_sim is None:
                 print(
-                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}{wer_str}  {entry['checkpoint']}"
+                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}{stats_score_str}{wer_str}  "
+                    f"{entry['checkpoint']}"
                 )
             else:
                 print(
-                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}{wer_str}  spk {spk_sim:.4f}  "
-                    f"{entry['checkpoint']}"
+                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}{stats_score_str}{wer_str}  "
+                    f"spk {spk_sim:.4f}  {entry['checkpoint']}"
                 )
     print(f"Wrote {best_path}")
     print(f"Wrote {results_path}")
