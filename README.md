@@ -105,6 +105,10 @@ python src/speak.py --profile name1 --text "Hello, this is a test."
 - Early stop: training writes `epoch_stats.json` (val/dur/f0) and stops early when it hits the sweet-spot range or overfits. Adjust thresholds in `outputs/training/<profile>/config_ft.yml` under `early_stop`.
 - `--auto_tune_profile`: writes `profile.json` (auto alpha/beta/steps/scale/f0).
 - `--auto_select_epoch`: writes `best_epoch.txt` + `epoch_scores.json` (evaluates all epochs unless `--select_limit` is set).
+- `--select_stats_min_epoch`: ignore early epoch stats during selection.
+- `--select_overfit_floor_factor`: reject epochs with val_loss below median * factor.
+- `--select_use_wer`: add transcription WER penalty during selection.
+- `--select_wer_weight`: weight of WER penalty.
 - `--auto_build_lexicon`: writes `data/<name>/lexicon.json`.
 - `--lexicon_lang`: language code for lexicon generation (defaults to `en-ca`).
 - `--tune_ref_wav` / `--select_ref_wav`: reference wav for tuning/selection.
@@ -129,6 +133,8 @@ python src/speak.py --profile name1 --text "Hello, this is a test."
 - `--max_chunk_chars` / `--max_chunk_words`: auto-split long text to avoid BERT token limits.
 - `--pause_ms`: silence inserted between chunks.
 - `--pitch_shift`: semitone shift post-process (negative = deeper voice).
+- `--de_esser_cutoff`: apply a gentle low-pass de-esser at this cutoff Hz (0 disables).
+- `--de_esser_order`: filter order for de-esser (default 2).
 - `--seed`: deterministic generation (default 1234); use `--no_seed` to disable.
 API requests can also pass `max_chunk_chars`, `max_chunk_words`, and `pause_ms` to control chunking.
 
@@ -137,6 +143,7 @@ API requests can also pass `max_chunk_chars`, `max_chunk_words`, and `pause_ms` 
 - Training now defaults `spect_params.f_max` to 8000 Hz when missing, to reduce high-frequency sharpness.
 - `src/inference.py` caches the model in memory for low latency.
 - `src/auto_tune_profile.py` writes `profile.json` next to a checkpoint with tuned defaults.
+- `profile.json` now also stores model/config/ref paths plus chunking + post-processing defaults.
 - Auto-tuning adapts alpha/beta if pitch correlation is low or timbre similarity is too high.
 - It also reduces embedding/diffusion when centroid_ratio is too bright (sharpness).
 - If `profile.json` or `f0_scale.txt` exist next to a model, inference will use them automatically.
