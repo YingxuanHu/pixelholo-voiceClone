@@ -1,6 +1,7 @@
 import argparse
 import json
 import re
+import tempfile
 from pathlib import Path
 
 import librosa
@@ -71,6 +72,20 @@ def _harmonic_ratio(audio: np.ndarray) -> float:
     return _rms(harmonic) / (_rms(audio) + 1e-6)
 
 
+def _hf_ratio(audio: np.ndarray, sr: int, low_hz: float = 6000.0, high_hz: float = 10000.0) -> float:
+    if not audio.size:
+        return 0.0
+    n_fft = 1024
+    hop = 256
+    spec = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    total = spec[freqs >= 80.0].sum()
+    if total <= 0:
+        return 0.0
+    band = spec[(freqs >= low_hz) & (freqs <= high_hz)].sum()
+    return float(band / total)
+
+
 def _mfcc_dtw_distance(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> float:
     mfcc_ref = librosa.feature.mfcc(y=ref_audio, sr=sr, n_mfcc=13)
     mfcc_out = librosa.feature.mfcc(y=out_audio, sr=sr, n_mfcc=13)
@@ -100,6 +115,40 @@ def _f0_correlation(ref_f0: np.ndarray, out_f0: np.ndarray) -> float:
     ref = (ref - ref.mean()) / (ref.std() + 1e-6)
     out = (out - out.mean()) / (out.std() + 1e-6)
     return float(np.mean(ref * out))
+
+
+def _normalize_wer_text(text: str) -> list[str]:
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    return [w for w in words if w]
+
+
+def _word_error_rate(reference: str, hypothesis: str) -> float:
+    ref_words = _normalize_wer_text(reference)
+    hyp_words = _normalize_wer_text(hypothesis)
+    if not ref_words:
+        return 0.0
+    dp = [[0] * (len(hyp_words) + 1) for _ in range(len(ref_words) + 1)]
+    for i in range(len(ref_words) + 1):
+        dp[i][0] = i
+    for j in range(len(hyp_words) + 1):
+        dp[0][j] = j
+    for i in range(1, len(ref_words) + 1):
+        for j in range(1, len(hyp_words) + 1):
+            cost = 0 if ref_words[i - 1] == hyp_words[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost,
+            )
+    return float(dp[-1][-1]) / max(1, len(ref_words))
+
+
+def _transcribe_audio(model, audio: np.ndarray, sr: int, language: str | None) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".wav") as handle:
+        sf.write(handle.name, audio, sr)
+        segments, _info = model.transcribe(handle.name, language=language)
+        text = " ".join(seg.text.strip() for seg in segments if seg.text)
+        return text.strip()
 
 
 def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str, float]:
@@ -140,7 +189,10 @@ def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str,
     flat_out = float(np.mean(librosa.feature.spectral_flatness(y=out_trim)))
     zcr_out = float(np.mean(librosa.feature.zero_crossing_rate(out_trim)))
     harm_ratio = _harmonic_ratio(out_trim)
+    ref_dur = len(ref_trim) / sr
     out_dur = len(out_trim) / sr
+    dur_ratio = out_dur / ref_dur if ref_dur > 0 else 1.0
+    hf_ratio = _hf_ratio(out_trim, sr)
 
     return {
         "pitch_ratio": pitch_ratio,
@@ -154,10 +206,12 @@ def _metrics(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> dict[str,
         "zcr_out": zcr_out,
         "harm_ratio": harm_ratio,
         "out_dur": out_dur,
+        "dur_ratio": dur_ratio,
+        "hf_ratio": hf_ratio,
     }
 
 
-def _score(metrics: dict[str, float]) -> float:
+def _score(metrics: dict[str, float], wer_weight: float = 0.0) -> float:
     pitch_err = abs(np.log(metrics["pitch_ratio"])) if metrics["pitch_ratio"] > 0 else 1.0
     rms_err = abs(np.log(metrics["rms_ratio"])) if metrics["rms_ratio"] > 0 else 1.0
     centroid_err = abs(np.log(metrics["centroid_ratio"])) if metrics["centroid_ratio"] > 0 else 1.0
@@ -166,9 +220,17 @@ def _score(metrics: dict[str, float]) -> float:
     zcr_out = metrics.get("zcr_out", 0.0)
     harm_ratio = metrics.get("harm_ratio", 0.0)
     out_dur = metrics.get("out_dur", 0.0)
+    dur_ratio = metrics.get("dur_ratio", 1.0)
+    hf_ratio = metrics.get("hf_ratio", 0.0)
     dur_penalty = 0.0
     if out_dur < 0.5:
         dur_penalty = (0.5 - out_dur) * 4.0
+    dur_ratio_penalty = 0.0
+    if dur_ratio < 0.8:
+        dur_ratio_penalty = (0.8 - dur_ratio) * 2.0
+    elif dur_ratio > 1.25:
+        dur_ratio_penalty = (dur_ratio - 1.25) * 2.0
+    wer = metrics.get("wer")
     return (
         pitch_err
         + metrics["flat_diff"] * 2.0
@@ -179,6 +241,9 @@ def _score(metrics: dict[str, float]) -> float:
         + (zcr_out * 0.3)
         + (1.0 - harm_ratio) * 0.6
         + dur_penalty
+        + dur_ratio_penalty
+        + (hf_ratio * 2.0)
+        + ((wer * wer_weight) if isinstance(wer, (int, float)) else 0.0)
         - metrics["mfcc_cos"] * 0.1
         - metrics["f0_corr"] * 0.1
     )
@@ -351,6 +416,17 @@ def main() -> None:
     parser.add_argument("--embedding_scale", type=float, help="Override embedding scale.")
     parser.add_argument("--save_best", action="store_true", help="Save best sample wav.")
     parser.add_argument("--use_resemblyzer", action="store_true", help="Include speaker similarity score.")
+    parser.add_argument("--use_wer", action="store_true", help="Include transcription WER in scoring.")
+    parser.add_argument("--wer_weight", type=float, default=0.8, help="Penalty weight for WER.")
+    parser.add_argument("--wer_model_size", type=str, default="tiny.en", help="faster-whisper model size.")
+    parser.add_argument("--wer_device", type=str, help="Device for WER transcription (cuda/cpu).")
+    parser.add_argument(
+        "--wer_compute_type",
+        type=str,
+        default="float16",
+        help="Compute type for WER transcription.",
+    )
+    parser.add_argument("--wer_language", type=str, help="Language code for WER transcription.")
     parser.add_argument(
         "--quality_top_n",
         type=int,
@@ -383,6 +459,18 @@ def main() -> None:
     )
     parser.add_argument("--phonemizer_lang", type=str, help="Override phonemizer language.")
     parser.add_argument("--lexicon_path", type=Path, help="Lexicon JSON for phoneme overrides.")
+    parser.add_argument(
+        "--stats_min_epoch",
+        type=int,
+        default=0,
+        help="Ignore epoch_stats entries below this epoch.",
+    )
+    parser.add_argument(
+        "--overfit_floor_factor",
+        type=float,
+        default=0.8,
+        help="Reject epochs with val_loss below median * factor.",
+    )
     parser.set_defaults(prefer_earlier=True)
 
     args = parser.parse_args()
@@ -455,17 +543,61 @@ def main() -> None:
         raise FileNotFoundError("No reference wavs found. Provide --ref_wav or --ref_dir.")
 
     epoch_stats = _load_epoch_stats(training_dir / "epoch_stats.json")
+    if args.stats_min_epoch > 0:
+        epoch_stats = {k: v for k, v in epoch_stats.items() if k >= args.stats_min_epoch}
+    if epoch_stats:
+        val_losses = [
+            v.get("val_loss")
+            for v in epoch_stats.values()
+            if isinstance(v.get("val_loss"), (int, float))
+        ]
+        val_losses = [v for v in val_losses if np.isfinite(v)]
+        if val_losses:
+            median_val = float(np.median(val_losses))
+            overfit_floor = median_val * args.overfit_floor_factor
+            allowed_epochs = {
+                ep
+                for ep, stats in epoch_stats.items()
+                if isinstance(stats.get("val_loss"), (int, float))
+                and np.isfinite(stats.get("val_loss"))
+                and stats["val_loss"] >= overfit_floor
+            }
+            if allowed_epochs:
+                filtered = [
+                    ckpt
+                    for ckpt in checkpoints
+                    if (epoch := _epoch_index(str(ckpt))) is not None and epoch in allowed_epochs
+                ]
+                if filtered:
+                    print(
+                        f"Filtered checkpoints below overfit floor {overfit_floor:.3f} "
+                        f"(kept {len(filtered)} of {len(checkpoints)})"
+                    )
+                    checkpoints = filtered
     results = []
     store_audio = args.save_best or args.use_resemblyzer
     best_audio_by_ckpt = {} if store_audio else None
     best_ref_by_ckpt = {} if store_audio else None
     sample_rate = _load_sample_rate(config_path)
 
+    wer_model = None
+    wer_language = args.wer_language
+    if args.use_wer:
+        try:
+            from faster_whisper import WhisperModel
+        except Exception as exc:
+            raise RuntimeError("faster-whisper not installed. Run `pip install faster-whisper`.") from exc
+        wer_device = args.wer_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        wer_compute_type = args.wer_compute_type or ("float16" if wer_device == "cuda" else "int8")
+        wer_model = WhisperModel(args.wer_model_size, device=wer_device, compute_type=wer_compute_type)
+
     print(f"Evaluating {len(checkpoints)} checkpoints...")
     print(f"alpha={alpha} beta={beta} diffusion={diffusion_steps} embedding={embedding_scale} f0_scale={f0_scale}")
     print(f"Using {len(ref_wavs)} reference wav(s) and {len(texts)} prompt(s).")
 
-    for ckpt in checkpoints:
+    total_ckpts = len(checkpoints)
+    for idx, ckpt in enumerate(checkpoints, start=1):
+        print(f"[{idx}/{total_ckpts}] Scoring {ckpt.name}...")
         engine = StyleTTS2RepoEngine(model_path=ckpt, config_path=config_path)
         all_metrics: dict[str, list[float]] = {
             "pitch_ratio": [],
@@ -479,11 +611,15 @@ def main() -> None:
             "zcr_out": [],
             "harm_ratio": [],
             "out_dur": [],
+            "dur_ratio": [],
+            "hf_ratio": [],
+            "wer": [],
         }
         failures = 0
         best_sample = None
         best_sample_score = None
         best_sample_ref = None
+        sample_scores: list[float] = []
         for ref_path in ref_wavs:
             ref_audio = _load_mono(ref_path, engine.sample_rate)
             for text in texts:
@@ -500,7 +636,10 @@ def main() -> None:
                         lexicon=lexicon,
                     )
                     metrics = _metrics(ref_audio, audio, engine.sample_rate)
-                    score = _score(metrics)
+                    if wer_model is not None:
+                        hypothesis = _transcribe_audio(wer_model, audio, engine.sample_rate, wer_language)
+                        metrics["wer"] = _word_error_rate(text, hypothesis)
+                    score = _score(metrics, wer_weight=args.wer_weight if wer_model is not None else 0.0)
                     for key, value in metrics.items():
                         if np.isfinite(value):
                             all_metrics[key].append(float(value))
@@ -508,17 +647,19 @@ def main() -> None:
                         best_sample_score = score
                         best_sample = audio
                         best_sample_ref = ref_path
+                    sample_scores.append(score)
                 except Exception:
                     failures += 1
                     continue
 
         summary = {}
         for key, values in all_metrics.items():
-            summary[key] = float(np.mean(values)) if values else 0.0
+            summary[key] = float(np.median(values)) if values else 0.0
         epoch_index = _epoch_index(str(ckpt))
         stats = epoch_stats.get(epoch_index) if epoch_index is not None else None
         stats_penalty = _stats_penalty(stats) if stats else 0.0
-        score = _score(summary) + (failures * 0.5) + stats_penalty
+        base_score = float(np.median(sample_scores)) if sample_scores else _score(summary)
+        score = base_score + (failures * 0.5) + stats_penalty
         entry = {
             "checkpoint": str(ckpt),
             "score": score,
@@ -625,14 +766,16 @@ def main() -> None:
                     and np.isfinite(f0)
                 ):
                     stats_str = f"  val={val:.3f} dur={dur:.3f} f0={f0:.3f}"
+            wer = entry.get("metrics", {}).get("wer")
+            wer_str = f"  wer={wer:.3f}" if isinstance(wer, (int, float)) and np.isfinite(wer) else ""
             spk_sim = entry.get("spk_sim")
             if spk_sim is None:
                 print(
-                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}  {entry['checkpoint']}"
+                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}{wer_str}  {entry['checkpoint']}"
                 )
             else:
                 print(
-                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}  spk {spk_sim:.4f}  "
+                    f"  epoch {epoch_display}  score {entry['score']:.5f}{stats_str}{wer_str}  spk {spk_sim:.4f}  "
                     f"{entry['checkpoint']}"
                 )
     print(f"Wrote {best_path}")

@@ -75,6 +75,12 @@ def _harmonic_ratio(audio: np.ndarray) -> float:
     return _rms(harmonic) / (_rms(audio) + 1e-6)
 
 
+def _centroid_mean(audio: np.ndarray, sr: int) -> float:
+    if not audio.size:
+        return 0.0
+    return float(np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr)))
+
+
 def _mfcc_dtw_distance(ref_audio: np.ndarray, out_audio: np.ndarray, sr: int) -> float:
     mfcc_ref = librosa.feature.mfcc(y=ref_audio, sr=sr, n_mfcc=13)
     mfcc_out = librosa.feature.mfcc(y=out_audio, sr=sr, n_mfcc=13)
@@ -392,6 +398,17 @@ def main() -> None:
     )
     parser.add_argument("--phonemizer_lang", type=str, help="Override phonemizer language.")
     parser.add_argument("--lexicon_path", type=Path, help="Lexicon JSON for phoneme overrides.")
+    parser.add_argument("--max_chunk_chars", type=int, default=180, help="Default max chunk chars.")
+    parser.add_argument("--max_chunk_words", type=int, default=45, help="Default max chunk words.")
+    parser.add_argument("--pause_ms", type=int, default=180, help="Default pause between chunks (ms).")
+    parser.add_argument("--pitch_shift", type=float, default=0.0, help="Default pitch shift in semitones.")
+    parser.add_argument(
+        "--de_esser_cutoff",
+        type=float,
+        default=0.0,
+        help="Default de-esser cutoff Hz (0 disables).",
+    )
+    parser.add_argument("--de_esser_order", type=int, default=2, help="Default de-esser filter order.")
 
     args = parser.parse_args()
 
@@ -471,6 +488,8 @@ def main() -> None:
     probe_text = texts[0]
     f0_scales = []
     ref_f0s = []
+    ref_rms_vals = []
+    ref_centroid_vals = []
     for ref_path in ref_wavs:
         ref_audio = _load_mono(ref_path, sr)
         probe_audio = engine.generate(
@@ -484,13 +503,18 @@ def main() -> None:
             phonemizer_lang=args.phonemizer_lang,
             lexicon=lexicon,
         )
-        f0_ref = _median_f0(_trim(ref_audio), sr)
+        ref_trim = _trim(ref_audio)
+        f0_ref = _median_f0(ref_trim, sr)
         f0_out = _median_f0(_trim(probe_audio), sr)
         f0_scales.append(1.0 / (f0_out / f0_ref))
         ref_f0s.append(f0_ref)
+        ref_rms_vals.append(_rms(ref_trim))
+        ref_centroid_vals.append(_centroid_mean(ref_trim, sr))
 
     f0_scale = float(np.median(f0_scales)) if f0_scales else 1.0
     ref_f0_median = float(np.median(ref_f0s)) if ref_f0s else None
+    ref_rms_median = float(np.median(ref_rms_vals)) if ref_rms_vals else None
+    ref_centroid_median = float(np.median(ref_centroid_vals)) if ref_centroid_vals else None
     target_f0 = args.target_f0_hz
     if target_f0 and ref_f0_median:
         target_scale = target_f0 / ref_f0_median
@@ -557,6 +581,17 @@ def main() -> None:
         "f0_scale": best["f0_scale"],
         "score": best["score"],
         "metrics": best["metrics"],
+        "max_chunk_chars": args.max_chunk_chars,
+        "max_chunk_words": args.max_chunk_words,
+        "pause_ms": args.pause_ms,
+        "pitch_shift": args.pitch_shift,
+        "de_esser_cutoff": args.de_esser_cutoff,
+        "de_esser_order": args.de_esser_order,
+        "ref_stats": {
+            "f0_median": ref_f0_median,
+            "centroid_median": ref_centroid_median,
+            "rms_median": ref_rms_median,
+        },
     }
     if args.phonemizer_lang:
         profile["phonemizer_lang"] = args.phonemizer_lang

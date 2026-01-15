@@ -112,6 +112,26 @@ def _apply_pitch_shift(
     return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _apply_de_esser(
+    audio: np.ndarray,
+    sample_rate: int,
+    cutoff_hz: float,
+    order: int,
+) -> np.ndarray:
+    if cutoff_hz <= 0:
+        return audio
+    nyquist = sample_rate * 0.5
+    if cutoff_hz >= nyquist:
+        return audio
+    try:
+        from scipy.signal import butter, sosfilt
+    except Exception as exc:
+        raise RuntimeError("Missing scipy for de-esser filtering.") from exc
+    sos = butter(order, cutoff_hz, btype="lowpass", fs=sample_rate, output="sos")
+    filtered = sosfilt(sos, audio.astype(np.float32))
+    return np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -324,6 +344,8 @@ class GenerateRequest(BaseModel):
     embedding_scale: float | None = None
     f0_scale: float | None = None
     pitch_shift: float | None = None
+    de_esser_cutoff: float | None = None
+    de_esser_order: int | None = None
     seed: int | None = None
     max_chunk_chars: int | None = None
     max_chunk_words: int | None = None
@@ -651,9 +673,22 @@ def generate(req: GenerateRequest):
 
     try:
         engine = _get_engine(model_path, config_path)
-        max_chars = req.max_chunk_chars or DEFAULT_MAX_CHUNK_CHARS
-        max_words = req.max_chunk_words or DEFAULT_MAX_CHUNK_WORDS
-        pause_ms = req.pause_ms if req.pause_ms is not None else DEFAULT_PAUSE_MS
+        profile = _load_profile_defaults(model_path)
+        max_chars = (
+            req.max_chunk_chars
+            if req.max_chunk_chars is not None
+            else profile.get("max_chunk_chars", DEFAULT_MAX_CHUNK_CHARS)
+        )
+        max_words = (
+            req.max_chunk_words
+            if req.max_chunk_words is not None
+            else profile.get("max_chunk_words", DEFAULT_MAX_CHUNK_WORDS)
+        )
+        pause_ms = (
+            req.pause_ms
+            if req.pause_ms is not None
+            else profile.get("pause_ms", DEFAULT_PAUSE_MS)
+        )
         chunks = _split_text(req.text, max_chars, max_words)
         if not chunks:
             raise HTTPException(status_code=400, detail="Text is empty.")
@@ -678,8 +713,25 @@ def generate(req: GenerateRequest):
             if idx < len(chunks) - 1:
                 parts.append(pause)
         audio = np.concatenate(parts)
-        if req.pitch_shift is not None and req.pitch_shift != 0:
-            audio = _apply_pitch_shift(audio, engine.sample_rate, req.pitch_shift)
+        pitch_shift = (
+            req.pitch_shift
+            if req.pitch_shift is not None
+            else profile.get("pitch_shift", 0.0)
+        )
+        if pitch_shift:
+            audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
+        de_esser_cutoff = (
+            req.de_esser_cutoff
+            if req.de_esser_cutoff is not None
+            else profile.get("de_esser_cutoff", 0.0)
+        )
+        de_esser_order = (
+            req.de_esser_order
+            if req.de_esser_order is not None
+            else profile.get("de_esser_order", 2)
+        )
+        if de_esser_cutoff:
+            audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
     except HTTPException:
         raise
     except Exception as exc:
