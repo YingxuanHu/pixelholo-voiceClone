@@ -65,9 +65,9 @@ def _pick_reference_wav(profile_dir: Path) -> Path | None:
     return best[1] if best else wavs[0]
 
 
-def _load_profile_defaults(model_path: Path) -> dict:
+def _load_profile_defaults(base_dir: Path) -> dict:
     for filename in ("profile.json", "inference_defaults.json"):
-        candidate = model_path.parent / filename
+        candidate = base_dir / filename
         if candidate.exists():
             try:
                 data = json.loads(candidate.read_text())
@@ -135,6 +135,21 @@ def _apply_pitch_shift(audio: np.ndarray, sample_rate: int, semitones: float) ->
     return np.nan_to_num(shifted, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _apply_de_esser(audio: np.ndarray, sample_rate: int, cutoff_hz: float, order: int) -> np.ndarray:
+    if cutoff_hz <= 0:
+        return audio
+    nyquist = sample_rate * 0.5
+    if cutoff_hz >= nyquist:
+        return audio
+    try:
+        from scipy.signal import butter, sosfilt
+    except Exception as exc:
+        raise RuntimeError("Missing scipy for de-esser filtering.") from exc
+    sos = butter(order, cutoff_hz, btype="lowpass", fs=sample_rate, output="sos")
+    filtered = sosfilt(sos, audio.astype(np.float32))
+    return np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="One-step local inference (no server).")
     parser.add_argument("--profile", help="Profile name (uses outputs/training/<profile>).")
@@ -153,26 +168,38 @@ def main() -> None:
     parser.add_argument(
         "--max_chunk_chars",
         type=int,
-        default=180,
+        default=None,
         help="Split long text into chunks of this many characters.",
     )
     parser.add_argument(
         "--max_chunk_words",
         type=int,
-        default=45,
+        default=None,
         help="Split long text into chunks of this many words.",
     )
     parser.add_argument(
         "--pause_ms",
         type=int,
-        default=180,
+        default=None,
         help="Silence between chunks (ms).",
     )
     parser.add_argument(
         "--pitch_shift",
         type=float,
-        default=0.0,
+        default=None,
         help="Pitch shift in semitones (negative for deeper voice).",
+    )
+    parser.add_argument(
+        "--de_esser_cutoff",
+        type=float,
+        default=None,
+        help="Apply low-pass de-esser at this cutoff Hz (0 disables).",
+    )
+    parser.add_argument(
+        "--de_esser_order",
+        type=int,
+        default=None,
+        help="Filter order for de-esser (higher = stronger).",
     )
     parser.add_argument(
         "--seed",
@@ -194,7 +221,19 @@ def main() -> None:
     elif args.model_path:
         training_dir = args.model_path.parent
 
+    defaults = {}
+    if training_dir is not None:
+        defaults = _load_profile_defaults(training_dir)
+        if args.profile and not defaults:
+            raise FileNotFoundError(
+                f"profile.json not found in {training_dir}. Run auto_tune_profile to generate it."
+            )
+
     model_path = args.model_path
+    if model_path is None:
+        candidate = defaults.get("model_path")
+        if candidate:
+            model_path = Path(candidate)
     if model_path is None and training_dir is not None:
         model_path = _find_best_checkpoint(training_dir) or _find_latest_checkpoint(training_dir)
 
@@ -203,6 +242,10 @@ def main() -> None:
 
     config_path = args.config_path
     if config_path is None:
+        candidate = defaults.get("config_path")
+        if candidate:
+            config_path = Path(candidate)
+    if config_path is None:
         candidate = model_path.parent / "config_ft.yml"
         if candidate.exists():
             config_path = candidate
@@ -210,7 +253,8 @@ def main() -> None:
     if config_path is None or not config_path.exists():
         raise FileNotFoundError("Config not found. Provide --config_path or ensure config_ft.yml exists.")
 
-    defaults = _load_profile_defaults(model_path)
+    if not defaults:
+        defaults = _load_profile_defaults(model_path.parent)
     ref_wav = args.ref_wav
     if ref_wav is None:
         candidate = defaults.get("ref_wav_path")
@@ -255,11 +299,31 @@ def main() -> None:
             lexicon_path = candidate
     lexicon = _load_lexicon(Path(lexicon_path)) if lexicon_path else None
 
+    max_chunk_chars = args.max_chunk_chars
+    if max_chunk_chars is None:
+        max_chunk_chars = defaults.get("max_chunk_chars", 180)
+    max_chunk_words = args.max_chunk_words
+    if max_chunk_words is None:
+        max_chunk_words = defaults.get("max_chunk_words", 45)
+    pause_ms = args.pause_ms
+    if pause_ms is None:
+        pause_ms = defaults.get("pause_ms", 180)
+    pitch_shift = args.pitch_shift
+    if pitch_shift is None:
+        pitch_shift = defaults.get("pitch_shift", 0.0)
+    de_esser_cutoff = args.de_esser_cutoff
+    if de_esser_cutoff is None:
+        de_esser_cutoff = defaults.get("de_esser_cutoff", 0.0)
+    de_esser_order = args.de_esser_order
+    if de_esser_order is None:
+        de_esser_order = defaults.get("de_esser_order", 2)
+
     out_path = args.out
     if out_path is None:
-        out_dir = project_root / "outputs" / "inference"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{model_path.stem}_speak.wav"
+        base_out_dir = project_root / "outputs" / "inference"
+        profile_out_dir = base_out_dir / (args.profile or "manual")
+        profile_out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = profile_out_dir / f"{model_path.stem}_speak.wav"
 
     if not args.no_seed and args.seed is not None:
         random.seed(args.seed)
@@ -269,12 +333,12 @@ def main() -> None:
             torch.cuda.manual_seed_all(args.seed)
 
     engine = StyleTTS2RepoEngine(model_path=model_path, config_path=config_path)
-    chunks = _split_text(args.text, args.max_chunk_chars, args.max_chunk_words)
+    chunks = _split_text(args.text, max_chunk_chars, max_chunk_words)
     if not chunks:
         raise ValueError("No text to synthesize.")
 
     audio_parts: list[np.ndarray] = []
-    pause = np.zeros(int(engine.sample_rate * (args.pause_ms / 1000.0)), dtype=np.float32)
+    pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
     for idx, chunk in enumerate(chunks):
         audio = engine.generate(
             chunk,
@@ -293,8 +357,10 @@ def main() -> None:
             audio_parts.append(pause)
 
     audio = np.concatenate(audio_parts)
-    if args.pitch_shift:
-        audio = _apply_pitch_shift(audio, engine.sample_rate, args.pitch_shift)
+    if pitch_shift:
+        audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
+    if de_esser_cutoff:
+        audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
 
     sf.write(out_path, audio, engine.sample_rate)
     print(f"Saved: {out_path}")

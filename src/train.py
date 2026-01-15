@@ -344,6 +344,22 @@ def main() -> None:
         help="Disable thorough selection even when auto-select is enabled.",
     )
     parser.add_argument("--select_limit", type=int, help="Check last N checkpoints")
+    parser.add_argument("--select_stats_min_epoch", type=int, help="Ignore epoch_stats entries below this epoch.")
+    parser.add_argument(
+        "--select_overfit_floor_factor",
+        type=float,
+        help="Reject epochs with val_loss below median * factor.",
+    )
+    parser.add_argument(
+        "--select_use_wer",
+        action="store_true",
+        help="Include transcription WER in epoch selection scoring.",
+    )
+    parser.add_argument("--select_wer_weight", type=float, help="Penalty weight for WER.")
+    parser.add_argument("--select_wer_model_size", type=str, help="faster-whisper model size for WER.")
+    parser.add_argument("--select_wer_device", type=str, help="Device for WER transcription.")
+    parser.add_argument("--select_wer_compute_type", type=str, help="Compute type for WER transcription.")
+    parser.add_argument("--select_wer_language", type=str, help="Language code for WER transcription.")
     parser.add_argument(
         "--auto_build_lexicon",
         action="store_true",
@@ -453,6 +469,22 @@ def main() -> None:
             command.append("--thorough")
         if args.select_limit is not None:
             command += ["--limit", str(args.select_limit)]
+        if args.select_stats_min_epoch is not None:
+            command += ["--stats_min_epoch", str(args.select_stats_min_epoch)]
+        if args.select_overfit_floor_factor is not None:
+            command += ["--overfit_floor_factor", str(args.select_overfit_floor_factor)]
+        if args.select_use_wer:
+            command.append("--use_wer")
+        if args.select_wer_weight is not None:
+            command += ["--wer_weight", str(args.select_wer_weight)]
+        if args.select_wer_model_size is not None:
+            command += ["--wer_model_size", str(args.select_wer_model_size)]
+        if args.select_wer_device is not None:
+            command += ["--wer_device", str(args.select_wer_device)]
+        if args.select_wer_compute_type is not None:
+            command += ["--wer_compute_type", str(args.select_wer_compute_type)]
+        if args.select_wer_language is not None:
+            command += ["--wer_language", str(args.select_wer_language)]
         ref = args.select_ref_wav or args.tune_ref_wav or auto_ref
         if ref:
             command += ["--ref_wav", str(ref)]
