@@ -180,6 +180,33 @@ def _apply_de_esser(audio: np.ndarray, sample_rate: int, cutoff_hz: float, order
     return np.nan_to_num(filtered, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _smart_vad_trim(
+    audio: np.ndarray,
+    sample_rate: int,
+    top_db: float = 30.0,
+    frame_length: int = 1024,
+    hop_length: int = 256,
+    pad_ms: float = 50.0,
+) -> np.ndarray:
+    try:
+        import librosa
+    except Exception:
+        return audio
+    if audio.size == 0:
+        return audio
+    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+    rms_db = librosa.power_to_db(rms * rms, ref=np.max)
+    non_silent = np.flatnonzero(rms_db > -top_db)
+    if non_silent.size == 0:
+        return audio
+    start = librosa.frames_to_samples(non_silent[0], hop_length=hop_length)
+    end = librosa.frames_to_samples(non_silent[-1], hop_length=hop_length)
+    pad = int(sample_rate * (pad_ms / 1000.0))
+    start = max(0, start - pad)
+    end = min(audio.size, end + pad)
+    return audio[start:end]
+
+
 def _soft_clip(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
     if audio.size == 0:
         return audio
@@ -190,19 +217,46 @@ def _soft_clip(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
     return np.tanh(audio / threshold) * threshold
 
 
-def _apply_crossfade(chunks: list[np.ndarray], sample_rate: int, crossfade_ms: float) -> np.ndarray:
+def _remove_dc(audio: np.ndarray) -> np.ndarray:
+    if audio.size == 0:
+        return audio
+    audio = audio.astype(np.float32, copy=False)
+    return audio - float(np.mean(audio))
+
+
+def _apply_crossfade(
+    chunks: list[np.ndarray],
+    sample_rate: int,
+    crossfade_ms: float,
+    fade_edges_ms: float = 8.0,
+) -> np.ndarray:
     if not chunks:
         return np.array([], dtype=np.float32)
-    if crossfade_ms <= 0:
-        return np.concatenate(chunks)
     cross_len = int(sample_rate * (crossfade_ms / 1000.0))
+    fade_len = int(sample_rate * (fade_edges_ms / 1000.0))
+
+    def _edge_fade(audio: np.ndarray) -> np.ndarray:
+        if fade_len <= 1:
+            return audio
+        effective_len = fade_len
+        if effective_len * 2 > audio.size:
+            effective_len = max(1, audio.size // 2)
+        audio = audio.astype(np.float32, copy=False)
+        fade_in = np.linspace(0.0, 1.0, effective_len, dtype=np.float32)
+        fade_out = np.linspace(1.0, 0.0, effective_len, dtype=np.float32)
+        audio[:effective_len] *= fade_in
+        audio[-effective_len:] *= fade_out
+        return audio
+
     if cross_len < 2:
-        return np.concatenate(chunks)
-    faded = chunks[0].astype(np.float32, copy=False)
-    fade_out = np.linspace(1.0, 0.0, cross_len, dtype=np.float32)
-    fade_in = np.linspace(0.0, 1.0, cross_len, dtype=np.float32)
+        return np.concatenate([_edge_fade(c) for c in chunks])
+
+    faded = _edge_fade(chunks[0].astype(np.float32, copy=False))
+    t = np.linspace(0.0, 1.0, cross_len, dtype=np.float32)
+    fade_in = np.sin(t * (np.pi / 2.0))
+    fade_out = np.cos(t * (np.pi / 2.0))
     for nxt in chunks[1:]:
-        nxt = nxt.astype(np.float32, copy=False)
+        nxt = _edge_fade(nxt.astype(np.float32, copy=False))
         if faded.size < cross_len or nxt.size < cross_len:
             faded = np.concatenate([faded, nxt])
             continue
@@ -211,6 +265,22 @@ def _apply_crossfade(chunks: list[np.ndarray], sample_rate: int, crossfade_ms: f
         blended = tail + head
         faded = np.concatenate([faded[:-cross_len], blended, nxt[cross_len:]])
     return faded
+
+
+def _fade_edges(audio: np.ndarray, sample_rate: int, fade_ms: float = 5.0) -> np.ndarray:
+    if audio.size == 0:
+        return audio
+    fade_len = int(sample_rate * (fade_ms / 1000.0))
+    if fade_len <= 1:
+        return audio
+    if fade_len * 2 > audio.size:
+        fade_len = max(1, audio.size // 2)
+    audio = audio.astype(np.float32, copy=False)
+    fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+    fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+    audio[:fade_len] *= fade_in
+    audio[-fade_len:] *= fade_out
+    return audio
 
 
 def main() -> None:
@@ -269,6 +339,29 @@ def main() -> None:
         type=int,
         default=None,
         help="Filter order for de-esser (higher = stronger).",
+    )
+    parser.add_argument(
+        "--pad_text",
+        action="store_true",
+        help="Wrap each chunk with a pause token to push artifacts into silence.",
+    )
+    parser.add_argument(
+        "--pad_text_token",
+        type=str,
+        default=None,
+        help="Token used for pad_text (default: '...').",
+    )
+    parser.add_argument(
+        "--smart_trim_db",
+        type=float,
+        default=None,
+        help="Trim chunk using RMS VAD (dB); 0 disables.",
+    )
+    parser.add_argument(
+        "--smart_trim_pad_ms",
+        type=float,
+        default=None,
+        help="Padding added around VAD trim (ms).",
     )
     parser.add_argument(
         "--seed",
@@ -389,6 +482,18 @@ def main() -> None:
     de_esser_order = args.de_esser_order
     if de_esser_order is None:
         de_esser_order = defaults.get("de_esser_order", 2)
+    pad_text = args.pad_text
+    if not pad_text:
+        pad_text = bool(defaults.get("pad_text", True))
+    pad_text_token = args.pad_text_token
+    if pad_text_token is None:
+        pad_text_token = defaults.get("pad_text_token", "...")
+    smart_trim_db = args.smart_trim_db
+    if smart_trim_db is None:
+        smart_trim_db = defaults.get("smart_trim_db", 30.0)
+    smart_trim_pad_ms = args.smart_trim_pad_ms
+    if smart_trim_pad_ms is None:
+        smart_trim_pad_ms = defaults.get("smart_trim_pad_ms", 50.0)
 
     out_path = args.out
     if out_path is None:
@@ -414,6 +519,8 @@ def main() -> None:
     pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
     chunk_seed = None if args.no_seed else args.seed
     for idx, chunk in enumerate(chunks):
+        if pad_text:
+            chunk = f"{pad_text_token} {chunk} {pad_text_token}"
         audio = engine.generate(
             chunk,
             ref_wav_path=ref_wav,
@@ -426,11 +533,20 @@ def main() -> None:
             lexicon=lexicon,
             seed=chunk_seed,
         )
-        audio_parts.append(audio.astype(np.float32, copy=False))
+        if smart_trim_db and smart_trim_db > 0:
+            audio = _smart_vad_trim(
+                audio,
+                engine.sample_rate,
+                top_db=float(smart_trim_db),
+                pad_ms=float(smart_trim_pad_ms),
+            )
+        audio = _remove_dc(audio.astype(np.float32, copy=False))
+        audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+        audio_parts.append(audio)
         if idx < len(chunks) - 1:
             audio_parts.append(pause)
 
-    audio = _apply_crossfade(audio_parts, engine.sample_rate, crossfade_ms)
+    audio = _apply_crossfade(audio_parts, engine.sample_rate, crossfade_ms, fade_edges_ms=8.0)
     if pitch_shift:
         audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
     if de_esser_cutoff:

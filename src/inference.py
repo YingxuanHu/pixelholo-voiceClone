@@ -1,25 +1,28 @@
 import base64
 import contextlib
-import math
 import json
 import io
+import math
 import os
 import random
 import re
 import shutil
 import subprocess
 import sys
-import threading
 import tempfile
+import threading
 import time
 import warnings
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import torch
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 warnings.filterwarnings(
@@ -35,6 +38,9 @@ warnings.filterwarnings(
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STYLE_TTS2_DIR = PROJECT_ROOT / "lib" / "StyleTTS2"
+
+sys.path.append(str(PROJECT_ROOT))
+from config import processed_wavs_dir, raw_videos_dir  # noqa: E402
 
 if STYLE_TTS2_DIR.exists():
     sys.path.insert(0, str(STYLE_TTS2_DIR))
@@ -55,6 +61,13 @@ _WORD_RE = re.compile(r"[A-Za-z']+|[^A-Za-z']+")
 _WORD_ONLY_RE = re.compile(r"[A-Za-z']+$")
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 _engine_lock = threading.Lock()
 _engines: dict[tuple[str, str], "StyleTTS2RepoEngine"] = {}
 _SIGMA_WARNED_PATHS: set[str] = set()
@@ -174,6 +187,13 @@ def _soft_clip(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
     return np.tanh(audio / threshold) * threshold
 
 
+def _remove_dc(audio: np.ndarray) -> np.ndarray:
+    if audio.size == 0:
+        return audio
+    audio = audio.astype(np.float32, copy=False)
+    return audio - float(np.mean(audio))
+
+
 def _apply_crossfade(chunks: list[np.ndarray], sample_rate: int, crossfade_ms: float) -> np.ndarray:
     if not chunks:
         return np.array([], dtype=np.float32)
@@ -183,8 +203,9 @@ def _apply_crossfade(chunks: list[np.ndarray], sample_rate: int, crossfade_ms: f
     if cross_len < 2:
         return np.concatenate(chunks)
     faded = chunks[0].astype(np.float32, copy=False)
-    fade_out = np.linspace(1.0, 0.0, cross_len, dtype=np.float32)
-    fade_in = np.linspace(0.0, 1.0, cross_len, dtype=np.float32)
+    t = np.linspace(0.0, 1.0, cross_len, dtype=np.float32)
+    fade_in = np.sin(t * (np.pi / 2.0))
+    fade_out = np.cos(t * (np.pi / 2.0))
     for nxt in chunks[1:]:
         nxt = nxt.astype(np.float32, copy=False)
         if faded.size < cross_len or nxt.size < cross_len:
@@ -197,12 +218,71 @@ def _apply_crossfade(chunks: list[np.ndarray], sample_rate: int, crossfade_ms: f
     return faded
 
 
+def _fade_edges(audio: np.ndarray, sample_rate: int, fade_ms: float = 5.0) -> np.ndarray:
+    if audio.size == 0:
+        return audio
+    fade_len = int(sample_rate * (fade_ms / 1000.0))
+    if fade_len <= 1:
+        return audio
+    if fade_len * 2 > audio.size:
+        fade_len = max(1, audio.size // 2)
+    audio = audio.astype(np.float32, copy=False)
+    fade_in = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+    fade_out = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+    audio[:fade_len] *= fade_in
+    audio[-fade_len:] *= fade_out
+    return audio
+
+
+def _smart_vad_trim(
+    audio: np.ndarray,
+    sample_rate: int,
+    top_db: float = 30.0,
+    frame_length: int = 1024,
+    hop_length: int = 256,
+    pad_ms: float = 50.0,
+) -> np.ndarray:
+    try:
+        import librosa
+    except Exception:
+        return audio
+    if audio.size == 0:
+        return audio
+    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+    rms_db = librosa.power_to_db(rms * rms, ref=np.max)
+    non_silent = np.flatnonzero(rms_db > -top_db)
+    if non_silent.size == 0:
+        return audio
+    start = librosa.frames_to_samples(non_silent[0], hop_length=hop_length)
+    end = librosa.frames_to_samples(non_silent[-1], hop_length=hop_length)
+    pad = int(sample_rate * (pad_ms / 1000.0))
+    start = max(0, start - pad)
+    end = min(audio.size, end + pad)
+    return audio[start:end]
+
+
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _stream_subprocess(command: list[str], cwd: Path) -> Iterator[str]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        yield line
+    exit_code = process.wait()
+    yield f"\n[process exited {exit_code}]\n"
 
 
 def _resolve_path(base_dir: Path, value: str | None) -> Path | None:
@@ -262,6 +342,73 @@ def _resolve_ref_wav(ref_wav_path: str | None, speaker: str | None) -> Path:
             "If using speaker, pass the speaker name."
         ),
     )
+
+
+def _resolve_model_path(model_path: str | None, speaker: str | None) -> Path:
+    if model_path:
+        candidate = Path(model_path).expanduser()
+        if candidate.exists():
+            return candidate
+        raise HTTPException(status_code=400, detail=f"model_path not found: {candidate}")
+
+    env_model = os.getenv("STYLE_TTS2_MODEL")
+    if env_model:
+        candidate = Path(env_model).expanduser()
+        if candidate.exists():
+            return candidate
+        raise HTTPException(status_code=400, detail=f"STYLE_TTS2_MODEL not found: {candidate}")
+
+    if speaker:
+        training_dir = PROJECT_ROOT / "outputs" / "training" / speaker
+        best_path = training_dir / "best_epoch.txt"
+        if best_path.exists():
+            content = best_path.read_text().strip()
+            if content:
+                candidate = Path(content)
+                if candidate.exists():
+                    return candidate
+        checkpoints = sorted(training_dir.glob("epoch_2nd_*.pth"))
+        if checkpoints:
+            return checkpoints[-1]
+
+    raise HTTPException(status_code=400, detail="model_path is required")
+
+
+def _list_profiles() -> list[dict[str, object]]:
+    data_root = PROJECT_ROOT / "data"
+    training_root = PROJECT_ROOT / "outputs" / "training"
+    names = set()
+    if data_root.exists():
+        names.update([p.name for p in data_root.iterdir() if p.is_dir()])
+    if training_root.exists():
+        names.update([p.name for p in training_root.iterdir() if p.is_dir()])
+    profiles: list[dict[str, object]] = []
+    for name in sorted(names):
+        data_dir = data_root / name
+        training_dir = training_root / name
+        raw_count = len(list((data_dir / "raw_videos").glob("*"))) if data_dir.exists() else 0
+        processed_count = len(list((data_dir / "processed_wavs").glob("*.wav"))) if data_dir.exists() else 0
+        profile_json = training_dir / "profile.json"
+        best_epoch = None
+        best_path = training_dir / "best_epoch.txt"
+        if best_path.exists():
+            content = best_path.read_text().strip()
+            if content:
+                best_epoch = content
+        checkpoints = sorted(training_dir.glob("epoch_2nd_*.pth")) if training_dir.exists() else []
+        latest_ckpt = str(checkpoints[-1]) if checkpoints else None
+        profiles.append(
+            {
+                "name": name,
+                "has_data": data_dir.exists(),
+                "raw_files": raw_count,
+                "processed_wavs": processed_count,
+                "has_profile": profile_json.exists(),
+                "best_checkpoint": best_epoch,
+                "latest_checkpoint": latest_ckpt,
+            }
+        )
+    return profiles
 
 
 def _resolve_config_path(model_path: Path, config_path: str | None) -> Path:
@@ -411,12 +558,34 @@ class GenerateRequest(BaseModel):
     pitch_shift: float | None = None
     de_esser_cutoff: float | None = None
     de_esser_order: int | None = None
+    pad_text: bool | None = None
+    pad_text_token: str | None = None
+    smart_trim_db: float | None = None
+    smart_trim_pad_ms: float | None = None
     seed: int | None = None
     max_chunk_chars: int | None = None
     max_chunk_words: int | None = None
     pause_ms: int | None = None
     crossfade_ms: float | None = None
     return_base64: bool = False
+
+
+class PreprocessRequest(BaseModel):
+    profile: str
+    filename: str
+
+
+class TrainRequest(BaseModel):
+    profile: str
+    batch_size: int | None = None
+    epochs: int | None = None
+    max_len: int | None = None
+    auto_select_epoch: bool = True
+    auto_tune_profile: bool = True
+    auto_build_lexicon: bool = True
+    select_thorough: bool = True
+    select_use_wer: bool = False
+    early_stop: bool = True
 
 
 class StyleTTS2RepoEngine:
@@ -720,16 +889,213 @@ def _startup() -> None:
         _get_engine(model_path, config_path)
 
 
+@app.get("/profiles")
+def profiles():
+    return {"profiles": _list_profiles()}
+
+
+@app.post("/upload")
+def upload(profile: str = Form(...), file: UploadFile = File(...)):
+    if not profile:
+        raise HTTPException(status_code=400, detail="profile is required")
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="file is required")
+    dest_dir = raw_videos_dir(profile)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    filename = Path(file.filename).name
+    dest_path = dest_dir / filename
+    with dest_path.open("wb") as handle:
+        shutil.copyfileobj(file.file, handle)
+    return {"saved_path": str(dest_path), "filename": filename}
+
+
+@app.post("/preprocess")
+def preprocess(req: PreprocessRequest):
+    profile = req.profile.strip()
+    if not profile:
+        raise HTTPException(status_code=400, detail="profile is required")
+    video_path = raw_videos_dir(profile) / req.filename
+    if not video_path.exists():
+        raise HTTPException(status_code=400, detail=f"file not found: {video_path}")
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "src" / "preprocess.py"),
+        "--video",
+        str(video_path),
+        "--name",
+        profile,
+    ]
+    return StreamingResponse(
+        _stream_subprocess(command, cwd=PROJECT_ROOT),
+        media_type="text/plain",
+    )
+
+
+@app.post("/train")
+def train(req: TrainRequest):
+    profile = req.profile.strip()
+    if not profile:
+        raise HTTPException(status_code=400, detail="profile is required")
+    dataset_path = PROJECT_ROOT / "data" / profile
+    if not dataset_path.exists():
+        raise HTTPException(status_code=400, detail=f"dataset not found: {dataset_path}")
+    command = [
+        sys.executable,
+        str(PROJECT_ROOT / "src" / "train.py"),
+        "--dataset_path",
+        str(dataset_path),
+    ]
+    if req.batch_size:
+        command += ["--batch_size", str(req.batch_size)]
+    if req.epochs:
+        command += ["--epochs", str(req.epochs)]
+    if req.max_len:
+        command += ["--max_len", str(req.max_len)]
+    if req.auto_select_epoch:
+        command.append("--auto_select_epoch")
+        if req.select_thorough:
+            command.append("--select_thorough")
+        if req.select_use_wer:
+            command.append("--select_use_wer")
+    if req.auto_tune_profile:
+        command.append("--auto_tune_profile")
+    if req.auto_build_lexicon:
+        command.append("--auto_build_lexicon")
+    if not req.early_stop:
+        command.append("--no_early_stop")
+    return StreamingResponse(
+        _stream_subprocess(command, cwd=PROJECT_ROOT),
+        media_type="text/plain",
+    )
+
+
+@app.post("/stream")
+def stream(req: GenerateRequest):
+    start_time = time.perf_counter()
+    model_path = _resolve_model_path(req.model_path, req.speaker)
+    config_path = _resolve_config_path(model_path, req.config_path)
+    ref_wav_path = _resolve_ref_wav(req.ref_wav_path, req.speaker)
+    params = _resolve_inference_params(model_path, req)
+    phonemizer_lang = _resolve_phonemizer_lang(model_path, req)
+    lexicon_path = _resolve_lexicon_path(model_path, req, req.speaker)
+    lexicon = _load_lexicon(lexicon_path)
+
+    engine = _get_engine(model_path, config_path)
+    profile = _load_profile_defaults(model_path)
+    max_chars = (
+        req.max_chunk_chars
+        if req.max_chunk_chars is not None
+        else profile.get("max_chunk_chars", DEFAULT_MAX_CHUNK_CHARS)
+    )
+    max_words = (
+        req.max_chunk_words
+        if req.max_chunk_words is not None
+        else profile.get("max_chunk_words", DEFAULT_MAX_CHUNK_WORDS)
+    )
+    pause_ms = (
+        req.pause_ms
+        if req.pause_ms is not None
+        else profile.get("pause_ms", DEFAULT_PAUSE_MS)
+    )
+    pad_text = (
+        req.pad_text
+        if req.pad_text is not None
+        else profile.get("pad_text", True)
+    )
+    pad_text_token = (
+        req.pad_text_token
+        if req.pad_text_token is not None
+        else profile.get("pad_text_token", "...")
+    )
+    smart_trim_db = (
+        req.smart_trim_db
+        if req.smart_trim_db is not None
+        else profile.get("smart_trim_db", 30.0)
+    )
+    smart_trim_pad_ms = (
+        req.smart_trim_pad_ms
+        if req.smart_trim_pad_ms is not None
+        else profile.get("smart_trim_pad_ms", 50.0)
+    )
+    crossfade_ms = (
+        req.crossfade_ms
+        if req.crossfade_ms is not None
+        else profile.get("crossfade_ms", 8.0)
+    )
+    chunks = _split_text(req.text, max_chars, max_words)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Text is empty.")
+    seed = req.seed if req.seed is not None else profile.get("seed")
+    if seed is None and len(chunks) > 1:
+        seed = 1234
+    pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+
+    def _generator() -> Iterator[str]:
+        for idx, chunk in enumerate(chunks):
+            if pad_text:
+                chunk = f"{pad_text_token} {chunk} {pad_text_token}"
+            audio = engine.generate(
+                chunk,
+                ref_wav_path=ref_wav_path,
+                alpha=params["alpha"],
+                beta=params["beta"],
+                diffusion_steps=params["diffusion_steps"],
+                embedding_scale=params["embedding_scale"],
+                f0_scale=params["f0_scale"],
+                phonemizer_lang=phonemizer_lang,
+                lexicon=lexicon,
+                seed=seed,
+            )
+            if smart_trim_db and smart_trim_db > 0:
+                audio = _smart_vad_trim(
+                    audio,
+                    engine.sample_rate,
+                    top_db=float(smart_trim_db),
+                    pad_ms=float(smart_trim_pad_ms),
+                )
+            audio = _remove_dc(audio.astype(np.float32, copy=False))
+            audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+            if idx < len(chunks) - 1 and pause.size:
+                audio = np.concatenate([audio, pause])
+            pitch_shift = (
+                req.pitch_shift
+                if req.pitch_shift is not None
+                else profile.get("pitch_shift", 0.0)
+            )
+            if pitch_shift:
+                audio = _apply_pitch_shift(audio, engine.sample_rate, pitch_shift)
+            de_esser_cutoff = (
+                req.de_esser_cutoff
+                if req.de_esser_cutoff is not None
+                else profile.get("de_esser_cutoff", 0.0)
+            )
+            de_esser_order = (
+                req.de_esser_order
+                if req.de_esser_order is not None
+                else profile.get("de_esser_order", 2)
+            )
+            if de_esser_cutoff:
+                audio = _apply_de_esser(audio, engine.sample_rate, de_esser_cutoff, int(de_esser_order))
+            audio = _soft_clip(audio)
+            wav_bytes = _audio_to_wav_bytes(audio, engine.sample_rate)
+            payload = base64.b64encode(wav_bytes).decode("ascii")
+            yield json.dumps(
+                {
+                    "chunk_index": idx,
+                    "audio_base64": payload,
+                    "sample_rate": engine.sample_rate,
+                }
+            ) + "\n"
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        yield json.dumps({"event": "done", "inference_ms": round(elapsed_ms, 2)}) + "\n"
+
+    return StreamingResponse(_generator(), media_type="application/x-ndjson")
+
+
 @app.post("/generate")
 def generate(req: GenerateRequest):
     start_time = time.perf_counter()
-    model_path_value = req.model_path or os.getenv("STYLE_TTS2_MODEL")
-    if not model_path_value:
-        raise HTTPException(status_code=400, detail="model_path is required")
-
-    model_path = Path(model_path_value).expanduser()
-    if not model_path.exists():
-        raise HTTPException(status_code=400, detail=f"model_path not found: {model_path}")
+    model_path = _resolve_model_path(req.model_path, req.speaker)
 
     config_path = _resolve_config_path(model_path, req.config_path)
     ref_wav_path = _resolve_ref_wav(req.ref_wav_path, req.speaker)
@@ -756,6 +1122,26 @@ def generate(req: GenerateRequest):
             if req.pause_ms is not None
             else profile.get("pause_ms", DEFAULT_PAUSE_MS)
         )
+        pad_text = (
+            req.pad_text
+            if req.pad_text is not None
+            else profile.get("pad_text", True)
+        )
+        pad_text_token = (
+            req.pad_text_token
+            if req.pad_text_token is not None
+            else profile.get("pad_text_token", "...")
+        )
+        smart_trim_db = (
+            req.smart_trim_db
+            if req.smart_trim_db is not None
+            else profile.get("smart_trim_db", 30.0)
+        )
+        smart_trim_pad_ms = (
+            req.smart_trim_pad_ms
+            if req.smart_trim_pad_ms is not None
+            else profile.get("smart_trim_pad_ms", 50.0)
+        )
         crossfade_ms = (
             req.crossfade_ms
             if req.crossfade_ms is not None
@@ -764,11 +1150,14 @@ def generate(req: GenerateRequest):
         chunks = _split_text(req.text, max_chars, max_words)
         if not chunks:
             raise HTTPException(status_code=400, detail="Text is empty.")
-        if req.seed is not None:
-            _seed_everything(req.seed)
         parts: list[np.ndarray] = []
         pause = np.zeros(int(engine.sample_rate * (pause_ms / 1000.0)), dtype=np.float32)
+        seed = req.seed if req.seed is not None else profile.get("seed")
+        if seed is None and len(chunks) > 1:
+            seed = 1234
         for idx, chunk in enumerate(chunks):
+            if pad_text:
+                chunk = f"{pad_text_token} {chunk} {pad_text_token}"
             audio = engine.generate(
                 chunk,
                 ref_wav_path=ref_wav_path,
@@ -779,9 +1168,18 @@ def generate(req: GenerateRequest):
                 f0_scale=params["f0_scale"],
                 phonemizer_lang=phonemizer_lang,
                 lexicon=lexicon,
-                seed=None,
+                seed=seed,
             )
-            parts.append(audio.astype(np.float32, copy=False))
+            if smart_trim_db and smart_trim_db > 0:
+                audio = _smart_vad_trim(
+                    audio,
+                    engine.sample_rate,
+                    top_db=float(smart_trim_db),
+                    pad_ms=float(smart_trim_pad_ms),
+                )
+            audio = _remove_dc(audio.astype(np.float32, copy=False))
+            audio = _fade_edges(audio, engine.sample_rate, fade_ms=5.0)
+            parts.append(audio)
             if idx < len(chunks) - 1:
                 parts.append(pause)
         audio = _apply_crossfade(parts, engine.sample_rate, crossfade_ms)

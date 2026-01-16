@@ -644,6 +644,10 @@ def main() -> None:
         "pitch_shift": args.pitch_shift,
         "de_esser_cutoff": args.de_esser_cutoff,
         "de_esser_order": args.de_esser_order,
+        "pad_text": True,
+        "pad_text_token": "...",
+        "smart_trim_db": 30.0,
+        "smart_trim_pad_ms": 50.0,
         "ref_stats": {
             "f0_median": ref_f0_median,
             "centroid_median": ref_centroid_median,

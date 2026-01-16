@@ -340,19 +340,19 @@ def main() -> None:
     parser.add_argument(
         "--early_stop_overfit_val",
         type=float,
-        default=0.35,
+        default=0.38,
         help="Early-stop if val_loss falls below this (overfit).",
     )
     parser.add_argument(
         "--early_stop_overfit_dur",
         type=float,
-        default=1.0,
+        default=1.1,
         help="Early-stop if dur_loss falls below this (overfit).",
     )
     parser.add_argument(
         "--early_stop_overfit_f0",
         type=float,
-        default=0.8,
+        default=0.9,
         help="Early-stop if f0_loss falls below this (overfit).",
     )
     parser.set_defaults(early_stop=True)
